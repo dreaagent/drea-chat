@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Drea Chat</title>
+
+<!-- ===== Security Headers (Meta Equivalents) ===== -->
+<!-- NOTE: if you ever HOST this file instead of running it locally, also send
+     real HTTP headers: Content-Security-Policy (with frame-ancestors 'none')
+     and X-Content-Type-Options: nosniff — the meta tags below cannot do those. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' file:; script-src 'self' file: 'unsafe-inline'; style-src 'self' file: 'unsafe-inline'; img-src 'self' file: data: blob:; font-src 'self' file:; connect-src 'self' file: http: https:; object-src 'none'; base-uri 'self'; form-action 'self';">
+<meta name="referrer" content="no-referrer">
+
+<!-- ===== Local Styles ===== -->
+<link rel="stylesheet" href="css/styles.css">
+<link rel="stylesheet" href="third-party/github-dark.min.css">
+
+<!-- ===== Third-Party Libraries (Local) ===== -->
+<script src="third-party/marked.min.js"></script>
+<script src="third-party/highlight.min.js"></script>
+<script src="third-party/purify.min.js"></script>
+</head>
+<body>
+
+<div class="app">
+  <!-- Sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-mark">Drea <span>Chat</span></div>
+      <div class="brand-tag">v1</div>
+    </div>
+
+    <button type="button" class="new-chat-btn" id="newChatBtn">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+      New conversation
+    </button>
+
+    <div class="conversations" id="conversations">
+      <div id="convList"></div>
+    </div>
+
+    <div class="sidebar-footer">
+      <button type="button" class="settings-btn" id="settingsBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        Settings
+        <span class="status-dot" id="statusDot"></span>
+      </button>
+    </div>
+  </aside>
+  <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
+
+  <!-- Main -->
+  <main class="main">
+    <div class="topbar">
+      <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open sidebar">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      </button>
+      <div class="topbar-title" id="topbarTitle">New conversation</div>
+      <div class="topbar-spacer"></div>
+      <div class="model-pill" id="modelPill">
+        <span class="pulse"></span>
+        <span id="modelPillName">no model</span>
+        <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 9l6 6 6-6"/></svg>
+        <div class="model-dropdown" id="modelDropdown"></div>
+      </div>
+      <div class="cost-pill" id="costPill" title="Estimated cost for this branch">
+        <span class="dot"></span>
+        <span id="costPillText">$0.00</span>
+      </div>
+      <button type="button" class="topbar-action" id="exportChatBtn">Export chat</button>
+    </div>
+
+    <div class="messages" id="messages">
+      <div class="messages-inner" id="messagesInner"></div>
+    </div>
+
+    <div class="composer-wrap">
+      <form class="composer" id="composer">
+        <button type="button" class="attach-btn" id="attachBtn" title="Attach image" aria-label="Attach image">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+        </button>
+        <textarea id="input" rows="1" placeholder="Message the model…"></textarea>
+        <div class="image-preview" id="imagePreview"></div>
+        <button type="submit" class="send-btn" id="sendBtn" disabled aria-label="Send message">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        </button>
+      </form>
+      <div class="composer-hint">
+        <kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for newline · <kbd>Esc</kbd> to stop · paste or drop images to attach
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- Settings Modal -->
+<div class="modal-overlay" id="modalOverlay">
+  <div class="modal">
+    <h2>Connection</h2>
+    <div class="modal-sub">Configure your OpenAI-compatible endpoint. Stored locally in your browser only.</div>
+
+    <div class="field">
+      <label>Presets</label>
+      <div class="preset-list" id="presetList"></div>
+      <div class="preset-save-row">
+        <input type="text" id="cfgPresetName" placeholder="Name this preset…" maxlength="80" />
+        <button type="button" class="btn" id="savePresetBtn">Save current</button>
+        <button type="button" class="btn" id="cancelEditPresetBtn" style="display:none">Cancel</button>
+      </div>
+      <div class="hint">Save the current connection, model, API key, and sampler settings as a named preset. Presets appear in the chat header dropdown for quick switching. Click <strong>Edit</strong> on a preset to update it. Drag the grip handle to reorder.</div>
+    </div>
+
+    <div class="field">
+      <label>Endpoint URL</label>
+      <input type="text" id="cfgEndpoint" value="http://localhost:8080" />
+      <div class="hint">OpenAI-compatible base URL. The path <code>/chat/completions</code> is appended automatically. HTTPS is required for remote hosts; plain HTTP is only allowed for localhost.</div>
+    </div>
+
+    <div class="field">
+      <label>API Key</label>
+      <input type="password" id="cfgApiKey" placeholder="sk-… or leave blank" autocomplete="off" />
+      <div class="hint">Your private key for this preset. Never leaves this device. Leave blank to keep the currently stored key.</div>
+    </div>
+
+    <div class="field">
+      <label>Vault Protection</label>
+      <div class="sampler-head" style="margin-bottom: 12px;">
+        <input type="checkbox" id="cfgUseVault">
+        <label for="cfgUseVault">Encrypt API key with a vault password</label>
+      </div>
+      <div id="vaultFields" style="display: none;">
+        <input type="password" id="cfgVaultPassword" placeholder="Vault password" autocomplete="new-password" style="margin-bottom: 8px;" />
+        <input type="password" id="cfgVaultPasswordConfirm" placeholder="Confirm vault password" autocomplete="new-password" />
+      </div>
+      <div class="hint" id="vaultHint">When enabled, your API key is encrypted with AES-256-GCM before being stored in IndexedDB. The password itself is never saved.</div>
+    </div>
+
+    <div class="field">
+      <label>Model</label>
+      <input type="text" id="cfgModel" placeholder="e.g. meta-llama/Llama-3.3-70B-Instruct" />
+      <div class="hint">Any model name available on your endpoint.</div>
+    </div>
+
+    <div class="field">
+      <label>System Prompt</label>
+      <textarea id="cfgSystemPrompt" rows="4" placeholder="You are a helpful assistant."></textarea>
+      <div class="hint">Sets the behavior of the model. Applied to new conversations.</div>
+    </div>
+
+    <div class="field">
+      <label>Reasoning Effort</label>
+      <select id="cfgReasoningEffort">
+        <option value="none">None</option>
+        <option value="low">Low</option>
+        <option value="medium">Medium</option>
+        <option value="high">High</option>
+        <option value="xhigh">XHigh</option>
+        <option value="max">Max</option>
+      </select>
+      <div class="hint">Controls how much the model thinks before answering. Sent as <code>reasoning_effort</code>.</div>
+    </div>
+
+    <div class="field">
+      <label>Samplers</label>
+      <div class="sampler-grid">
+        <div class="sampler-item">
+          <div class="sampler-head">
+            <input type="checkbox" id="cfgTempEnabled" checked>
+            <label for="cfgTempEnabled">Temperature</label>
+          </div>
+          <input type="number" id="cfgTemp" value="0.7" step="0.1" min="0" max="2" />
+        </div>
+        <div class="sampler-item">
+          <div class="sampler-head">
+            <input type="checkbox" id="cfgTopPEnabled" checked>
+            <label for="cfgTopPEnabled">Top P</label>
+          </div>
+          <input type="number" id="cfgTopP" value="1" step="0.05" min="0" max="1" />
+        </div>
+        <div class="sampler-item">
+          <div class="sampler-head">
+            <input type="checkbox" id="cfgTopKEnabled">
+            <label for="cfgTopKEnabled">Top K</label>
+          </div>
+          <input type="number" id="cfgTopK" value="0" step="1" min="0" />
+        </div>
+      </div>
+      <div class="hint">Toggle which samplers to include in the request.</div>
+    </div>
+
+    <div class="field">
+      <label>Advanced Samplers</label>
+      <div class="sampler-head" style="margin-bottom:12px;">
+        <input type="checkbox" id="cfgAdvancedSamplersEnabled">
+        <label for="cfgAdvancedSamplersEnabled">Enable advanced samplers</label>
+      </div>
+      <div class="advanced-samplers disabled" id="advancedSamplersSection">
+        <div class="sampler-grid">
+          <div class="sampler-item">
+            <div class="sampler-head">
+              <input type="checkbox" id="cfgMinPEnabled">
+              <label for="cfgMinPEnabled">Min P</label>
+            </div>
+            <input type="number" id="cfgMinP" value="0.05" step="0.01" min="0" max="1" />
+          </div>
+          <div class="sampler-item">
+            <div class="sampler-head">
+              <input type="checkbox" id="cfgPowerLawTargetEnabled">
+              <label for="cfgPowerLawTargetEnabled">Power Law Target</label>
+            </div>
+            <input type="number" id="cfgPowerLawTarget" value="0.55" step="0.01" min="0" max="1" />
+          </div>
+          <div class="sampler-item">
+            <div class="sampler-head">
+              <input type="checkbox" id="cfgPowerLawDecayEnabled">
+              <label for="cfgPowerLawDecayEnabled">Power Law Decay</label>
+            </div>
+            <input type="number" id="cfgPowerLawDecay" value="0.95" step="0.01" min="0" max="0.99" />
+          </div>
+          <div class="sampler-item">
+            <div class="sampler-head">
+              <input type="checkbox" id="cfgAdaptiveTargetEnabled">
+              <label for="cfgAdaptiveTargetEnabled">Adaptive Target</label>
+            </div>
+            <input type="number" id="cfgAdaptiveTarget" value="0.55" step="0.01" min="0" max="1" />
+          </div>
+          <div class="sampler-item">
+            <div class="sampler-head">
+              <input type="checkbox" id="cfgAdaptiveDecayEnabled">
+              <label for="cfgAdaptiveDecayEnabled">Adaptive Decay</label>
+            </div>
+            <input type="number" id="cfgAdaptiveDecay" value="0.95" step="0.01" min="0" max="0.99" />
+          </div>
+        </div>
+      </div>
+      <div class="hint">Non-standard extensions. Only enable if your endpoint supports them.</div>
+    </div>
+
+    <div class="field">
+      <label>Max tokens</label>
+      <input type="number" id="cfgMaxTokens" value="8192" step="256" min="1" />
+    </div>
+
+    <div class="field">
+      <label>Usage reporting</label>
+      <div class="sampler-head" style="margin-bottom:0;">
+        <input type="checkbox" id="cfgRequestStreamUsage" checked>
+        <label for="cfgRequestStreamUsage">Request token usage in streaming responses</label>
+      </div>
+      <div class="hint">Sends <code>stream_options.include_usage</code> so endpoints that support it report exact input/output token counts.</div>
+    </div>
+
+    <div class="field">
+      <label>Token pricing</label>
+      <div class="field-row">
+        <div>
+          <input type="number" id="cfgInputPrice" value="0.30" step="0.01" min="0" />
+          <div class="hint">Input tokens ($ / 1M)</div>
+        </div>
+        <div>
+          <input type="number" id="cfgOutputPrice" value="1.20" step="0.01" min="0" />
+          <div class="hint">Output tokens ($ / 1M)</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>Images</label>
+      <div class="field-row">
+        <div>
+          <input type="number" id="cfgImageMaxDim" value="1024" step="64" min="64" max="8192" />
+          <div class="hint">Max dimension (px). Larger images are scaled down before sending.</div>
+        </div>
+        <div>
+          <input type="number" id="cfgImageQuality" value="0.85" step="0.05" min="0.1" max="1" />
+          <div class="hint">JPEG quality (0.1–1.0). Lower values shrink payload size.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-actions">
+      <button type="button" class="btn" id="lockVaultBtn" style="display:none;">Lock vault</button>
+      <button type="button" class="btn" id="importChats" style="margin-right: auto;">Import chats</button>
+      <button type="button" class="btn" id="exportAllChats">Export all chats</button>
+      <button type="button" class="btn" id="cancelSettings">Cancel</button>
+      <button type="button" class="btn btn-primary" id="saveSettings">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Vault Unlock Modal -->
+<div class="modal-overlay" id="unlockOverlay">
+  <div class="modal" style="max-width: 420px;">
+    <h2>Unlock Vault</h2>
+    <div class="modal-sub">Your API key is encrypted locally. Enter the vault password to use it.</div>
+
+    <div class="field">
+      <label>Vault Password</label>
+      <input type="password" id="unlockPassword" autocomplete="off" placeholder="Vault password" />
+      <div class="hint" id="unlockHint">The password is never stored or sent anywhere.</div>
+    </div>
+
+    <div class="modal-actions">
+      <button type="button" class="btn" id="unlockSkipBtn">Skip</button>
+      <button type="button" class="btn btn-primary" id="unlockBtn">Unlock</button>
+    </div>
+  </div>
+</div>
+
+<!-- Hidden file inputs -->
+<input type="file" id="importFileInput" accept=".json,application/json" style="display:none" />
+<input type="file" id="imageFileInput" accept="image/*" multiple style="display:none" />
+
+<div class="toast" id="toast"></div>
+
+<script src="js/app.js"></script>
+</body>
+</html>

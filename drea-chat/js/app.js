@@ -1,0 +1,2926 @@
+/* ============================================================
+   Drea Chat — single-file LLM chat client (hardened)
+   Robust SSE streaming: line-buffered, no token ever dropped.
+   Conversation tree with branching regeneration & user edits.
+   IndexedDB-backed persistence (conversations stored individually).
+   ============================================================ */
+
+// ---------- Config & persistence ----------
+const DEFAULTS = {
+  endpoint: 'http://localhost:8080',
+  apiKey: '',
+  apiKeyEncrypted: null,
+  model: '',
+  systemPrompt: '',
+  reasoningEffort: 'medium',
+
+  tempEnabled: true,
+  temperature: 0.7,
+
+  topPEnabled: true,
+  topP: 1.0,
+
+  topKEnabled: false,
+  topK: 0,
+
+  advancedSamplersEnabled: false,
+
+  minPEnabled: false,
+  minP: 0.05,
+
+  powerLawTargetEnabled: false,
+  powerLawTarget: 0.55,
+
+  powerLawDecayEnabled: false,
+  powerLawDecay: 0.95,
+
+  adaptiveTargetEnabled: false,
+  adaptiveTarget: 0.55,
+
+  adaptiveDecayEnabled: false,
+  adaptiveDecay: 0.95,
+
+  maxTokens: 8192,
+  requestStreamUsage: true,
+
+  inputPricePer1M: 0.30,
+  outputPricePer1M: 1.20,
+
+  imageMaxDim: 1024,
+  imageQuality: 0.85,
+
+  presets: [],
+  activePresetId: null,
+};
+
+const DB_NAME = 'drea_chat_db';
+const DB_VERSION = 1;
+const LEGACY_KEY = 'drea_chat_state_v1';
+
+let state = {
+  config: { ...DEFAULTS },
+  conversations: [],
+  activeId: null,
+  sidebarExpandedMonths: [],
+};
+
+let pendingEditOriginalNodeId = null;
+let editingPresetId = null;
+let vaultPassword = null; // in-memory only; never persisted
+
+// ---------- Security helpers ----------
+
+// Only allow data: URLs for raster images we produced ourselves (canvas.toDataURL).
+const SAFE_IMAGE_DATA_URL_RE = /^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=\s]+$/i;
+
+function isSafeImageDataUrl(u) {
+  return typeof u === 'string' && u.length > 0 && u.length < 40_000_000 && SAFE_IMAGE_DATA_URL_RE.test(u);
+}
+
+// Endpoint policy: HTTPS for anything remote; plain HTTP only for loopback.
+function isEndpointAllowed(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    if (u.protocol === 'https:') return true;
+    if (u.protocol === 'http:') {
+      const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+      return h === 'localhost' || h.endsWith('.localhost') || h === '127.0.0.1' || h === '::1';
+    }
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+
+// ---------- Vault crypto ----------
+const PBKDF2_ITERATIONS = 600_000;
+
+function u8ToB64(u8) {
+  let s = '';
+  for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+  return btoa(s);
+}
+
+function b64ToU8(b64) {
+  return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+}
+
+function concatU8(...parts) {
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+
+async function deriveKey(password, salt) {
+  const enc = new TextEncoder();
+  const mat = await crypto.subtle.importKey(
+    'raw', enc.encode(password), { name: 'PBKDF2' }, false, ['deriveKey']
+  );
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
+    mat,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+async function encryptSecret(plainText, password) {
+  if (!window.crypto || !crypto.subtle) {
+    throw new Error('Web Crypto API unavailable in this context');
+  }
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveKey(password, salt);
+  const ct = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv }, key, new TextEncoder().encode(plainText)
+  );
+  return u8ToB64(concatU8(salt, iv, new Uint8Array(ct)));
+}
+
+async function decryptSecret(cipherB64, password) {
+  const bytes = b64ToU8(cipherB64);
+  const salt = bytes.slice(0, 16);
+  const iv = bytes.slice(16, 28);
+  const ct = bytes.slice(28);
+  const key = await deriveKey(password, salt);
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+  return new TextDecoder().decode(pt);
+}
+
+// ---------- IndexedDB helpers ----------
+let db = null;
+
+function openDreaChatDB() {
+  return new Promise((resolve, reject) => {
+    if (!('indexedDB' in window)) {
+      reject(new Error('IndexedDB not supported'));
+      return;
+    }
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (event) => {
+      const dbInst = event.target.result;
+      if (!dbInst.objectStoreNames.contains('conversations')) {
+        dbInst.createObjectStore('conversations', { keyPath: 'id' });
+      }
+      if (!dbInst.objectStoreNames.contains('settings')) {
+        dbInst.createObjectStore('settings', { keyPath: 'key' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+    req.onblocked = () => reject(new Error('IndexedDB is blocked'));
+  });
+}
+
+async function dbGet(store, key) {
+  if (!db) return undefined;
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readonly');
+    const req = tx.objectStore(store).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function dbPut(store, value) {
+  if (!db) return;
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    const req = tx.objectStore(store).put(value);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function dbDelete(store, key) {
+  if (!db) return;
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    const req = tx.objectStore(store).delete(key);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function dbGetAll(store) {
+  if (!db) return [];
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readonly');
+    const req = tx.objectStore(store).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function dbClear(store) {
+  if (!db) return;
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    const req = tx.objectStore(store).clear();
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function maybeMigrateLegacyState() {
+  try {
+    const raw = localStorage.getItem(LEGACY_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (parsed.config) {
+      await dbPut('settings', { key: 'config', value: { ...DEFAULTS, ...(parsed.config || {}) } });
+    }
+    const convs = parsed.conversations || [];
+    for (const conv of convs) {
+      if (!conv || typeof conv !== 'object') continue;
+      if (Array.isArray(conv.messages)) {
+        if (!Number.isFinite(conv.createdAt) || conv.createdAt <= 0) {
+          const fromId = uidToDate(conv.id);
+          conv.createdAt = fromId || Date.now();
+        }
+        conv.messages = migrateFlatMessagesToTree(conv.messages).messages;
+      }
+      ensureRootNode(conv);
+      ensureConvCreatedAt(conv);
+      await dbPut('conversations', conv);
+    }
+    if (parsed.activeId !== undefined || parsed.sidebarExpandedMonths !== undefined) {
+      await dbPut('settings', {
+        key: 'app',
+        activeId: parsed.activeId || null,
+        sidebarExpandedMonths: Array.isArray(parsed.sidebarExpandedMonths) ? parsed.sidebarExpandedMonths : []
+      });
+    }
+    localStorage.removeItem(LEGACY_KEY);
+  } catch (e) {
+    console.warn('legacy migration failed', e);
+  }
+}
+
+async function loadState() {
+  try {
+    db = await openDreaChatDB();
+  } catch (e) {
+    console.warn('IndexedDB unavailable; chats will not persist', e);
+    toast('Storage unavailable — chats will not persist');
+    return;
+  }
+  try {
+    await maybeMigrateLegacyState();
+    const cfg = await dbGet('settings', 'config');
+    if (cfg && cfg.value) {
+      state.config = { ...DEFAULTS, ...cfg.value };
+      // If key is encrypted, keep plaintext empty until user unlocks
+      if (state.config.apiKeyEncrypted) {
+        state.config.apiKey = '';
+      }
+    }
+    const meta = await dbGet('settings', 'app');
+    if (meta) {
+      state.activeId = meta.activeId || null;
+      state.sidebarExpandedMonths = new Set(
+        Array.isArray(meta.sidebarExpandedMonths) ? meta.sidebarExpandedMonths : []
+      );
+    }
+    state.conversations = await dbGetAll('conversations');
+    normalizeState();
+  } catch (e) {
+    console.warn('load failed', e);
+  }
+}
+
+function normalizeState() {
+  for (const conv of state.conversations) {
+    if (!conv.messages || typeof conv.messages !== 'object') conv.messages = {};
+    if (!conv.hasOwnProperty('presetId')) conv.presetId = null;
+    ensureRootNode(conv);
+    ensureConvCreatedAt(conv);
+    for (const node of Object.values(conv.messages)) {
+      if (!node) continue;
+      if (Array.isArray(node.images)) {
+        const usable = node.images.filter(img => img && isSafeImageDataUrl(img.dataUrl));
+        if (usable.length) node.images = usable;
+        else delete node.images;
+      }
+      if (!Array.isArray(node.children)) node.children = [];
+      if (!Number.isFinite(node.selectedChildIndex)) node.selectedChildIndex = 0;
+    }
+  }
+}
+
+async function saveConfig() {
+  try {
+    const cfgToStore = { ...state.config };
+    // Defensive: never persist plaintext alongside ciphertext
+    if (cfgToStore.apiKeyEncrypted) {
+      cfgToStore.apiKey = '';
+    }
+    await dbPut('settings', { key: 'config', value: cfgToStore });
+  } catch (e) {
+    console.warn('save config failed', e);
+  }
+}
+
+async function saveAppState() {
+  try {
+    await dbPut('settings', {
+      key: 'app',
+      activeId: state.activeId,
+      sidebarExpandedMonths: Array.from(state.sidebarExpandedMonths || [])
+    });
+  } catch (e) {
+    console.warn('save app state failed', e);
+  }
+}
+
+async function saveConversation(conv) {
+  try {
+    await dbPut('conversations', conv);
+  } catch (e) {
+    console.warn('save conversation failed', e);
+  }
+}
+
+// ---------- Tree helpers ----------
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+
+function createMessageNode(role, content, parentId = null, extra = {}) {
+  return {
+    id: uid(),
+    role,
+    content,
+    reasoning: extra.reasoning || '',
+    images: extra.images || [],
+    parentId,
+    children: [],
+    selectedChildIndex: 0,
+    createdAt: Date.now(),
+  };
+}
+
+function createRootNode() {
+  return { id: '__root__', role: 'root', content: '', reasoning: '', images: [], parentId: null, children: [], selectedChildIndex: 0, createdAt: 0 };
+}
+
+function ensureRootNode(conv) {
+  if (!conv.messages) conv.messages = {};
+  if (conv.messages.__root__) return;
+  const root = createRootNode();
+  conv.messages.__root__ = root;
+  const orphanIds = [];
+  for (const id of Object.keys(conv.messages)) {
+    if (id === '__root__') continue;
+    const n = conv.messages[id];
+    if (!n) continue;
+    if (n.parentId === null || n.parentId === undefined) {
+      n.parentId = '__root__';
+      orphanIds.push(id);
+    }
+  }
+  orphanIds.sort((a, b) => (conv.messages[a].createdAt || 0) - (conv.messages[b].createdAt || 0));
+  root.children = orphanIds;
+  root.selectedChildIndex = Math.max(0, Math.min(root.selectedChildIndex, Math.max(0, orphanIds.length - 1)));
+}
+
+// ---------- Month / creation helpers ----------
+function getMonthKey(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function getMonthLabel(key, currentKey, lastKey) {
+  if (key === currentKey) return 'This month';
+  if (key === lastKey) return 'Last month';
+  const [y, m] = key.split('-').map(Number);
+  const d = new Date(y, m - 1, 1);
+  return d.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+}
+
+function uidToDate(id) {
+  if (typeof id !== 'string') return null;
+  const prefix = id.replace(/[^0-9a-z]+.*$/, '').slice(0, 12);
+  if (!prefix) return null;
+  const ts = parseInt(prefix, 36);
+  if (!Number.isFinite(ts) || ts < 946684800000 || ts > Date.now() + 86400000) return null;
+  return ts;
+}
+
+function ensureConvCreatedAt(conv) {
+  if (Number.isFinite(conv.createdAt) && conv.createdAt > 0) return;
+  let ts = null;
+  const root = conv.messages?.__root__;
+  const firstId = root?.children?.[0];
+  const first = firstId ? conv.messages[firstId] : null;
+  if (first && Number.isFinite(first.createdAt) && first.createdAt > 0) {
+    ts = first.createdAt;
+  }
+  if (!ts) ts = uidToDate(conv.id);
+  conv.createdAt = Number.isFinite(ts) && ts > 0 ? ts : Date.now();
+}
+
+function migrateFlatMessagesToTree(flatMessages) {
+  const messages = {};
+  const root = createRootNode();
+  messages.__root__ = root;
+  let prevId = '__root__';
+  for (const m of flatMessages || []) {
+    if (!m || typeof m !== 'object' || typeof m.content !== 'string') continue;
+    const node = {
+      id: uid(),
+      role: m.role === 'user' ? 'user' : 'assistant',
+      content: m.content,
+      reasoning: typeof m.reasoning === 'string' ? m.reasoning : '',
+      images: Array.isArray(m.images) ? m.images.filter(img => img && isSafeImageDataUrl(img.dataUrl)) : [],
+      parentId: prevId,
+      children: [],
+      selectedChildIndex: 0,
+      createdAt: Date.now(),
+    };
+    messages[node.id] = node;
+    messages[prevId].children.push(node.id);
+    prevId = node.id;
+  }
+  return { messages, rootId: '__root__' };
+}
+
+function getVisiblePath(conv) {
+  const path = [];
+  const root = conv?.messages?.__root__;
+  if (!root) return path;
+  let currentId = root.children[root.selectedChildIndex];
+  while (currentId) {
+    const node = conv.messages[currentId];
+    if (!node) break;
+    path.push(node);
+    if (node.children.length && node.selectedChildIndex >= 0 && node.selectedChildIndex < node.children.length) {
+      currentId = node.children[node.selectedChildIndex];
+    } else {
+      currentId = null;
+    }
+  }
+  return path;
+}
+
+function getCurrentLeaf(conv) {
+  const path = getVisiblePath(conv);
+  return path[path.length - 1] || null;
+}
+
+// ---------- Token cost helpers ----------
+function estimateTokens(text) {
+  return Math.ceil((text || '').length / 4);
+}
+
+function getBranchCost(conv, cfg) {
+  const path = getVisiblePath(conv);
+  const inputPrice = Number(cfg.inputPricePer1M ?? DEFAULTS.inputPricePer1M);
+  const outputPrice = Number(cfg.outputPricePer1M ?? DEFAULTS.outputPricePer1M);
+  let cost = 0;
+  let estimated = false;
+
+  for (let i = 0; i < path.length; i++) {
+    const node = path[i];
+    if (node.role !== 'assistant') continue;
+
+    const hasUsage = node.usage && (
+      Number.isFinite(node.usage.prompt_tokens) ||
+      Number.isFinite(node.usage.completion_tokens)
+    );
+
+    if (hasUsage) {
+      const inTok = node.usage.prompt_tokens || 0;
+      const outTok = node.usage.completion_tokens || 0;
+      cost += (inTok * inputPrice / 1e6) + (outTok * outputPrice / 1e6);
+    } else {
+      estimated = true;
+      let promptChars = (conv.systemPrompt || '').length;
+      for (let j = 0; j < i; j++) {
+        promptChars += (path[j].content || '').length;
+      }
+      const inTok = Math.ceil(promptChars / 4);
+      const outTok = estimateTokens(node.content);
+      cost += (inTok * inputPrice / 1e6) + (outTok * outputPrice / 1e6);
+    }
+  }
+
+  return { cost, estimated };
+}
+
+function formatMoney(value) {
+  const abs = Math.abs(value);
+  if (abs === 0) return '$0.00';
+  if (abs < 0.0001) return '< $0.0001';
+  if (abs < 0.001) return '$' + value.toFixed(6);
+  if (abs < 1) return '$' + value.toFixed(4);
+  return '$' + value.toFixed(2);
+}
+
+function renderCost() {
+  const pill = $('costPill');
+  const text = $('costPillText');
+  const conv = getActive();
+  if (!conv) {
+    pill.style.display = 'none';
+    return;
+  }
+  const cfg = getChatConfig(conv);
+  const path = getVisiblePath(conv);
+  const hasAssistant = path.some(n => n.role === 'assistant');
+  if (!hasAssistant) {
+    pill.style.display = 'none';
+    return;
+  }
+  const { cost, estimated } = getBranchCost(conv, cfg);
+  pill.style.display = 'flex';
+  pill.title = estimated
+    ? 'Estimated cost for this branch (endpoint did not report token usage)'
+    : 'Cost consumed by this branch';
+  text.textContent = (estimated ? '~ ' : '') + formatMoney(cost);
+}
+
+// ---------- DOM refs ----------
+const $ = (id) => document.getElementById(id);
+const messagesEl = $('messages');
+const messagesInner = $('messagesInner');
+const inputEl = $('input');
+const sendBtn = $('sendBtn');
+const composer = $('composer');
+const convList = $('convList');
+const topbarTitle = $('topbarTitle');
+const modelPillName = $('modelPillName');
+const exportChatBtn = $('exportChatBtn');
+const attachBtn = $('attachBtn');
+const imageFileInput = $('imageFileInput');
+const imagePreviewEl = $('imagePreview');
+
+// ---------- Presets ----------
+function getPresets() {
+  return Array.isArray(state.config.presets) ? state.config.presets : [];
+}
+
+function getActivePreset() {
+  return getPresets().find(p => p.id === state.config.activePresetId) || null;
+}
+
+function getPresetById(id) {
+  return getPresets().find(p => p.id === id) || null;
+}
+
+function getChatConfig(conv) {
+  const base = { ...state.config };
+  if (conv?.presetId) {
+    const preset = getPresetById(conv.presetId);
+    if (preset) {
+      const { id, name, ...settings } = preset;
+      return { ...base, ...settings };
+    }
+  }
+  return base;
+}
+
+function updateModelPill() {
+  const conv = getActive();
+  const convPreset = conv?.presetId ? getPresetById(conv.presetId) : null;
+  if (convPreset) {
+    modelPillName.textContent = convPreset.name;
+    modelPillName.title = `${convPreset.name} • ${convPreset.model || 'no model'}`;
+    return;
+  }
+  const active = getActivePreset();
+  if (active) {
+    modelPillName.textContent = active.name;
+    modelPillName.title = `${active.name} • ${active.model || 'no model'}`;
+  } else {
+    modelPillName.textContent = state.config.model || 'no model';
+    modelPillName.title = state.config.model ? 'Model' : 'No model configured';
+  }
+}
+
+function updateConfigUI() {
+  updateModelPill();
+  const ok = !!state.config.model && !!state.config.endpoint;
+  $('settingsBtn').classList.toggle('configured', ok);
+}
+
+function renderModelDropdown() {
+  const dropdown = $('modelDropdown');
+  const presets = getPresets();
+  const conv = getActive();
+  const activeId = conv?.presetId || state.config.activePresetId;
+
+  if (!presets.length) {
+    dropdown.innerHTML = '<div class="model-dropdown-empty">No presets saved.<br>Open Settings to create one.</div>';
+    return;
+  }
+
+  dropdown.innerHTML = '<div class="model-dropdown-header">Switch preset</div>';
+
+  for (const p of presets) {
+    const item = document.createElement('div');
+    item.className = 'model-dropdown-item' + (p.id === activeId ? ' active' : '');
+    const nameEl = document.createElement('span');
+    nameEl.className = 'preset-name';
+    nameEl.textContent = p.name;
+    const modelEl = document.createElement('span');
+    modelEl.className = 'preset-model';
+    modelEl.textContent = p.model || 'no model';
+    item.appendChild(nameEl);
+    item.appendChild(modelEl);
+    item.addEventListener('click', (e) => {
+      e.stopPropagation();
+      applyPreset(p.id);
+      closeModelDropdown();
+    });
+    dropdown.appendChild(item);
+  }
+
+  const divider = document.createElement('div');
+  divider.className = 'model-dropdown-divider';
+  dropdown.appendChild(divider);
+
+  const manage = document.createElement('div');
+  manage.className = 'model-dropdown-action';
+  manage.textContent = 'Manage presets…';
+  manage.addEventListener('click', (e) => {
+    e.stopPropagation();
+    closeModelDropdown();
+    openSettings();
+  });
+  dropdown.appendChild(manage);
+}
+
+function toggleModelDropdown() {
+  const pill = $('modelPill');
+  const dropdown = $('modelDropdown');
+  const open = dropdown.classList.contains('open');
+  if (open) {
+    closeModelDropdown();
+  } else {
+    renderModelDropdown();
+    dropdown.classList.add('open');
+    pill.classList.add('open');
+  }
+}
+
+function closeModelDropdown() {
+  $('modelDropdown').classList.remove('open');
+  $('modelPill').classList.remove('open');
+}
+
+async function applyPreset(id) {
+  const preset = getPresets().find(p => p.id === id);
+  if (!preset) return;
+  if (isStreaming) { toast('Stop the current stream first'); return; }
+
+  const { id: _id, name: _name, ...settings } = preset;
+  Object.assign(state.config, settings);
+
+  if (state.config.apiKeyEncrypted) {
+    state.config.apiKey = '';
+  }
+
+  state.config.activePresetId = id;
+
+  const conv = getActive();
+  if (conv) {
+    conv.presetId = id;
+    conv.systemPrompt = settings.systemPrompt || '';
+    await saveConversation(conv);
+    renderMessages();
+  }
+
+  await saveConfig();
+  updateConfigUI();
+  renderCost();
+  toast(`Switched to ${preset.name}`);
+
+  if ($('modalOverlay').classList.contains('open')) {
+    openSettings();
+  }
+}
+
+function gatherConfigFromInputs() {
+  const imageMaxDim = clampConfigInt($('cfgImageMaxDim').value, DEFAULTS.imageMaxDim, 64, 8192);
+  const imageQuality = clampConfigFloat($('cfgImageQuality').value, DEFAULTS.imageQuality, 0.1, 1);
+  $('cfgImageMaxDim').value = imageMaxDim;
+  $('cfgImageQuality').value = imageQuality;
+
+  return {
+    endpoint: ($('cfgEndpoint').value.trim() || DEFAULTS.endpoint).replace(/\/+$/, ''),
+    apiKey: $('cfgApiKey').value.trim(),
+    model: $('cfgModel').value.trim(),
+    systemPrompt: $('cfgSystemPrompt').value,
+    reasoningEffort: $('cfgReasoningEffort').value,
+    tempEnabled: $('cfgTempEnabled').checked,
+    temperature: Math.max(0, Math.min(2, parseFloat($('cfgTemp').value) || DEFAULTS.temperature)),
+    topPEnabled: $('cfgTopPEnabled').checked,
+    topP: Math.max(0, Math.min(1, parseFloat($('cfgTopP').value) || DEFAULTS.topP)),
+    topKEnabled: $('cfgTopKEnabled').checked,
+    topK: Math.max(0, parseInt($('cfgTopK').value, 10) || 0),
+    advancedSamplersEnabled: $('cfgAdvancedSamplersEnabled').checked,
+    minPEnabled: $('cfgMinPEnabled').checked,
+    minP: Math.max(0, Math.min(1, parseFloat($('cfgMinP').value) || DEFAULTS.minP)),
+    powerLawTargetEnabled: $('cfgPowerLawTargetEnabled').checked,
+    powerLawTarget: Math.max(0, Math.min(1, parseFloat($('cfgPowerLawTarget').value) || DEFAULTS.powerLawTarget)),
+    powerLawDecayEnabled: $('cfgPowerLawDecayEnabled').checked,
+    powerLawDecay: Math.max(0, Math.min(0.99, parseFloat($('cfgPowerLawDecay').value) || DEFAULTS.powerLawDecay)),
+    adaptiveTargetEnabled: $('cfgAdaptiveTargetEnabled').checked,
+    adaptiveTarget: Math.max(0, Math.min(1, parseFloat($('cfgAdaptiveTarget').value) || DEFAULTS.adaptiveTarget)),
+    adaptiveDecayEnabled: $('cfgAdaptiveDecayEnabled').checked,
+    adaptiveDecay: Math.max(0, Math.min(0.99, parseFloat($('cfgAdaptiveDecay').value) || DEFAULTS.adaptiveDecay)),
+    maxTokens: Math.max(1, parseInt($('cfgMaxTokens').value, 10) || DEFAULTS.maxTokens),
+    requestStreamUsage: $('cfgRequestStreamUsage').checked,
+    inputPricePer1M: Math.max(0, parseFloat($('cfgInputPrice').value) || DEFAULTS.inputPricePer1M),
+    outputPricePer1M: Math.max(0, parseFloat($('cfgOutputPrice').value) || DEFAULTS.outputPricePer1M),
+    imageMaxDim,
+    imageQuality,
+  };
+}
+
+async function loadPresetIntoInputs(preset) {
+  $('cfgEndpoint').value = preset.endpoint || '';
+
+  // SECURITY: never write a stored/decrypted key back into the DOM.
+  // A blank field means "keep the existing key".
+  $('cfgApiKey').value = '';
+  $('cfgApiKey').placeholder = (preset.apiKeyEncrypted || preset.apiKey)
+    ? '•••••••• (stored — type to replace)'
+    : 'sk-… or leave blank';
+
+  $('cfgUseVault').checked = !!preset.apiKeyEncrypted;
+  toggleVaultFields();
+
+  $('cfgModel').value = preset.model || '';
+  $('cfgSystemPrompt').value = preset.systemPrompt || '';
+  $('cfgReasoningEffort').value = preset.reasoningEffort || 'medium';
+  $('cfgTempEnabled').checked = preset.tempEnabled !== false;
+  $('cfgTemp').value = preset.temperature;
+  $('cfgTopPEnabled').checked = preset.topPEnabled !== false;
+  $('cfgTopP').value = preset.topP;
+  $('cfgTopKEnabled').checked = preset.topKEnabled === true;
+  $('cfgTopK').value = preset.topK;
+  $('cfgAdvancedSamplersEnabled').checked = preset.advancedSamplersEnabled === true;
+  $('cfgMinPEnabled').checked = preset.minPEnabled === true;
+  $('cfgMinP').value = preset.minP ?? DEFAULTS.minP;
+  $('cfgPowerLawTargetEnabled').checked = preset.powerLawTargetEnabled === true;
+  $('cfgPowerLawTarget').value = preset.powerLawTarget ?? DEFAULTS.powerLawTarget;
+  $('cfgPowerLawDecayEnabled').checked = preset.powerLawDecayEnabled === true;
+  $('cfgPowerLawDecay').value = preset.powerLawDecay ?? DEFAULTS.powerLawDecay;
+  $('cfgAdaptiveTargetEnabled').checked = preset.adaptiveTargetEnabled === true;
+  $('cfgAdaptiveTarget').value = preset.adaptiveTarget ?? DEFAULTS.adaptiveTarget;
+  $('cfgAdaptiveDecayEnabled').checked = preset.adaptiveDecayEnabled === true;
+  $('cfgAdaptiveDecay').value = preset.adaptiveDecay ?? DEFAULTS.adaptiveDecay;
+  $('cfgMaxTokens').value = preset.maxTokens;
+  $('cfgRequestStreamUsage').checked = preset.requestStreamUsage !== false;
+  $('cfgInputPrice').value = preset.inputPricePer1M ?? DEFAULTS.inputPricePer1M;
+  $('cfgOutputPrice').value = preset.outputPricePer1M ?? DEFAULTS.outputPricePer1M;
+  const cfgMaxDim = $('cfgImageMaxDim');
+  const cfgQuality = $('cfgImageQuality');
+  if (cfgMaxDim) cfgMaxDim.value = preset.imageMaxDim ?? DEFAULTS.imageMaxDim;
+  if (cfgQuality) cfgQuality.value = preset.imageQuality ?? DEFAULTS.imageQuality;
+  document.querySelectorAll('.sampler-grid .sampler-head input[type="checkbox"]').forEach(cb => cb.dispatchEvent(new Event('change')));
+  updateAdvancedControls();
+}
+
+function resetPresetEditMode() {
+  editingPresetId = null;
+  $('cfgPresetName').value = '';
+  $('savePresetBtn').textContent = 'Save current';
+  $('cancelEditPresetBtn').style.display = 'none';
+}
+
+async function enterPresetEditMode(preset) {
+  editingPresetId = preset.id;
+  await loadPresetIntoInputs(preset);
+  $('cfgPresetName').value = preset.name;
+  $('savePresetBtn').textContent = 'Update preset';
+  $('cancelEditPresetBtn').style.display = 'inline-block';
+}
+
+// Helper to process vault encryption for both global settings and presets.
+// existingPlainKey is used when the key field is left blank ("keep existing").
+async function applyVaultEncryption(cfg, existingEncryptedKey, existingPlainKey) {
+  const useVault = $('cfgUseVault').checked;
+  const vaultPw = $('cfgVaultPassword').value;
+  const vaultPwConfirm = $('cfgVaultPasswordConfirm').value;
+
+  if (useVault) {
+    let passwordToUse = vaultPw || vaultPassword;
+
+    if (vaultPw && vaultPw !== vaultPwConfirm) {
+      toast('Vault passwords do not match');
+      return null;
+    }
+    if (!passwordToUse && !existingEncryptedKey) {
+      toast('Please enter a vault password');
+      return null;
+    }
+
+    const keyToEncrypt = cfg.apiKey;
+
+    if (keyToEncrypt) {
+      if (!passwordToUse) {
+        toast('Please enter a vault password to encrypt the new key');
+        return null;
+      }
+      try {
+        cfg.apiKeyEncrypted = await encryptSecret(keyToEncrypt, passwordToUse);
+      } catch (e) {
+        toast('Could not enable vault: ' + e.message);
+        return null;
+      }
+      cfg.apiKey = '';
+      vaultPassword = passwordToUse;
+    } else if (existingEncryptedKey) {
+      // Keep existing encrypted key if no new key was entered
+      cfg.apiKeyEncrypted = existingEncryptedKey;
+      cfg.apiKey = '';
+    } else if (existingPlainKey) {
+      // Migrating a plaintext key into the vault
+      if (!passwordToUse) {
+        toast('Please enter a vault password to encrypt the key');
+        return null;
+      }
+      try {
+        cfg.apiKeyEncrypted = await encryptSecret(existingPlainKey, passwordToUse);
+      } catch (e) {
+        toast('Could not enable vault: ' + e.message);
+        return null;
+      }
+      cfg.apiKey = '';
+      vaultPassword = passwordToUse;
+    } else {
+      cfg.apiKeyEncrypted = null;
+      cfg.apiKey = '';
+    }
+  } else {
+    if (existingEncryptedKey && !vaultPassword) {
+      toast('Unlock the vault before disabling it');
+      return null;
+    }
+    cfg.apiKeyEncrypted = null;
+    // Blank field = keep the existing plaintext key
+    if (!cfg.apiKey && existingPlainKey) {
+      cfg.apiKey = existingPlainKey;
+    }
+  }
+  return cfg;
+}
+
+async function saveCurrentAsPreset(name) {
+  name = name.trim();
+  if (!name) { toast('Please enter a preset name'); return; }
+
+  const cfg = gatherConfigFromInputs();
+  if (!isEndpointAllowed(cfg.endpoint)) {
+    toast('Endpoint must use HTTPS (plain HTTP is only allowed for localhost)');
+    return;
+  }
+  const existingEnc = editingPresetId ? (getPresetById(editingPresetId)?.apiKeyEncrypted) : state.config.apiKeyEncrypted;
+  const existingPlain = editingPresetId ? (getPresetById(editingPresetId)?.apiKey || '') : state.config.apiKey;
+  const processedCfg = await applyVaultEncryption(cfg, existingEnc, existingPlain);
+  if (!processedCfg) return;
+
+  Object.assign(state.config, processedCfg);
+  const preset = { id: uid(), name, ...processedCfg };
+  if (!Array.isArray(state.config.presets)) state.config.presets = [];
+  state.config.presets.push(preset);
+  state.config.activePresetId = preset.id;
+
+  await saveConfig();
+  renderPresetsInSettings();
+  updateConfigUI();
+  renderCost();
+  toast('Preset saved');
+}
+
+async function updatePreset(id, name) {
+  name = name.trim();
+  if (!name) { toast('Please enter a preset name'); return; }
+
+  const presets = getPresets();
+  const idx = presets.findIndex(p => p.id === id);
+  if (idx < 0) return;
+
+  const cfg = gatherConfigFromInputs();
+  if (!isEndpointAllowed(cfg.endpoint)) {
+    toast('Endpoint must use HTTPS (plain HTTP is only allowed for localhost)');
+    return;
+  }
+  const existingEnc = getPresetById(id)?.apiKeyEncrypted;
+  const existingPlain = getPresetById(id)?.apiKey || '';
+  const processedCfg = await applyVaultEncryption(cfg, existingEnc, existingPlain);
+  if (!processedCfg) return;
+
+  presets[idx] = { ...presets[idx], ...processedCfg, id, name };
+
+  if (state.config.activePresetId === id) {
+    Object.assign(state.config, processedCfg);
+    state.config.activePresetId = id;
+  }
+
+  await saveConfig();
+  renderPresetsInSettings();
+  updateConfigUI();
+  renderCost();
+  toast('Preset updated');
+}
+
+async function deletePreset(id) {
+  if (!Array.isArray(state.config.presets)) return;
+  state.config.presets = state.config.presets.filter(p => p.id !== id);
+  if (state.config.activePresetId === id) {
+    state.config.activePresetId = null;
+  }
+  if (editingPresetId === id) {
+    resetPresetEditMode();
+  }
+  await saveConfig();
+  renderPresetsInSettings();
+  updateConfigUI();
+}
+
+async function reorderPresets(fromIndex, toIndex) {
+  const presets = getPresets();
+  if (fromIndex === toIndex || fromIndex < 0 || fromIndex >= presets.length) return;
+  if (toIndex < 0) toIndex = 0;
+  if (toIndex > presets.length) toIndex = presets.length;
+
+  const [moved] = presets.splice(fromIndex, 1);
+  if (toIndex > fromIndex) toIndex -= 1;
+  presets.splice(toIndex, 0, moved);
+
+  state.config.presets = presets;
+  await saveConfig();
+  renderPresetsInSettings();
+  updateConfigUI();
+  renderCost();
+}
+
+function renderPresetsInSettings() {
+  const list = $('presetList');
+  const presets = getPresets();
+  if (!presets.length) {
+    list.innerHTML = '<div style="color:var(--text-faint);font-size:12px;padding:6px 0;">No presets yet.</div>';
+    return;
+  }
+
+  list.innerHTML = '';
+  let draggedIndex = null;
+
+  presets.forEach((p, i) => {
+    const row = document.createElement('div');
+    row.className = 'preset-row';
+    row.dataset.index = i;
+
+    const isActive = p.id === state.config.activePresetId;
+
+    const grip = document.createElement('span');
+    grip.className = 'preset-drag';
+    grip.draggable = true;
+    grip.title = 'Drag to reorder';
+    grip.innerHTML = `
+      <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14">
+        <circle cx="9" cy="6" r="1.5"/>
+        <circle cx="15" cy="6" r="1.5"/>
+        <circle cx="9" cy="12" r="1.5"/>
+        <circle cx="15" cy="12" r="1.5"/>
+        <circle cx="9" cy="18" r="1.5"/>
+        <circle cx="15" cy="18" r="1.5"/>
+      </svg>`;
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'preset-name';
+    nameEl.textContent = p.name;
+    if (isActive) {
+      const dot = document.createElement('span');
+      dot.style.cssText = 'color:var(--accent);font-size:11px;margin-left:4px;';
+      dot.textContent = '●';
+      nameEl.appendChild(document.createTextNode(' '));
+      nameEl.appendChild(dot);
+    }
+
+    const modelEl = document.createElement('span');
+    modelEl.className = 'preset-model';
+    modelEl.textContent = p.model || 'no model';
+
+    const editBtn = document.createElement('button');
+    editBtn.type = 'button';
+    editBtn.className = 'edit-preset';
+    editBtn.textContent = 'Edit';
+
+    const applyBtn = document.createElement('button');
+    applyBtn.type = 'button';
+    applyBtn.className = 'apply-preset';
+    applyBtn.textContent = 'Apply';
+
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.className = 'danger delete-preset';
+    delBtn.textContent = 'Delete';
+
+    row.appendChild(grip);
+    row.appendChild(nameEl);
+    row.appendChild(modelEl);
+    row.appendChild(editBtn);
+    row.appendChild(applyBtn);
+    row.appendChild(delBtn);
+
+    grip.addEventListener('dragstart', (e) => {
+      draggedIndex = i;
+      e.dataTransfer.effectAllowed = 'move';
+      try {
+        e.dataTransfer.setData('text/plain', String(i));
+      } catch (_) {}
+      try {
+        const rect = row.getBoundingClientRect();
+        e.dataTransfer.setDragImage(row, e.clientX - rect.left, e.clientY - rect.top);
+      } catch (_) {}
+      row.classList.add('dragging');
+    });
+
+    grip.addEventListener('dragend', () => {
+      draggedIndex = null;
+      row.classList.remove('dragging');
+      document.querySelectorAll('.preset-row').forEach(r => r.classList.remove('drag-over-top', 'drag-over-bottom'));
+    });
+
+    row.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      if (draggedIndex === null || draggedIndex === i) return;
+      const rect = row.getBoundingClientRect();
+      const midY = rect.top + rect.height / 2;
+      row.classList.remove('drag-over-top', 'drag-over-bottom');
+      row.classList.add(e.clientY < midY ? 'drag-over-top' : 'drag-over-bottom');
+    });
+
+    row.addEventListener('dragleave', () => {
+      row.classList.remove('drag-over-top', 'drag-over-bottom');
+    });
+
+    row.addEventListener('drop', (e) => {
+      e.preventDefault();
+      if (draggedIndex === null || draggedIndex === i) return;
+      const rect = row.getBoundingClientRect();
+      const insertBefore = e.clientY < rect.top + rect.height / 2;
+      const targetIndex = insertBefore ? i : i + 1;
+      reorderPresets(draggedIndex, targetIndex);
+    });
+
+    editBtn.addEventListener('click', () => enterPresetEditMode(p));
+    applyBtn.addEventListener('click', () => {
+      applyPreset(p.id);
+      renderPresetsInSettings();
+    });
+    delBtn.addEventListener('click', () => deletePreset(p.id));
+
+    list.appendChild(row);
+  });
+}
+
+// ---------- Image attachments ----------
+let attachedImages = [];
+let imageUidCounter = 0;
+const MAX_IMAGES_PER_MESSAGE = 8;
+
+function newImageId() {
+  imageUidCounter += 1;
+  return 'img_' + Date.now().toString(36) + '_' + imageUidCounter;
+}
+
+function clampConfigInt(v, fallback, min, max) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+function clampConfigFloat(v, fallback, min, max) {
+  const n = parseFloat(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+function getImageMaxDim(cfg = state.config) {
+  return clampConfigInt(cfg.imageMaxDim, DEFAULTS.imageMaxDim, 64, 8192);
+}
+function getImageQuality(cfg = state.config) {
+  return clampConfigFloat(cfg.imageQuality, DEFAULTS.imageQuality, 0.1, 1);
+}
+
+function readFileAsImage(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Failed to read file'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('Failed to decode image'));
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function scaleImageToCanvas(img, maxDim, quality) {
+  const w0 = img.naturalWidth || img.width;
+  const h0 = img.naturalHeight || img.height;
+  const longest = Math.max(w0, h0);
+  const scale = longest > maxDim ? (maxDim / longest) : 1;
+  const w = Math.max(1, Math.round(w0 * scale));
+  const h = Math.max(1, Math.round(h0 * scale));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, 0, 0, w, h);
+
+  const dataUrl = canvas.toDataURL('image/jpeg', quality);
+  return {
+    canvas,
+    width: w,
+    height: h,
+    dataUrl,
+    scaled: scale < 1,
+    origWidth: w0,
+    origHeight: h0,
+  };
+}
+
+function makeThumb(canvas) {
+  const t = document.createElement('canvas');
+  const maxSide = 128;
+  const w0 = canvas.width;
+  const h0 = canvas.height;
+  const s = Math.max(w0, h0) > maxSide ? (maxSide / Math.max(w0, h0)) : 1;
+  t.width = Math.max(1, Math.round(w0 * s));
+  t.height = Math.max(1, Math.round(h0 * s));
+  t.getContext('2d').drawImage(canvas, 0, 0, t.width, t.height);
+  return t.toDataURL('image/jpeg', 0.7);
+}
+
+async function processImageFile(file, cfg = state.config) {
+  if (!file || !file.type || !file.type.startsWith('image/')) {
+    throw new Error('Not an image file');
+  }
+  const img = await readFileAsImage(file);
+  const maxDim = getImageMaxDim(cfg);
+  const quality = getImageQuality(cfg);
+  const result = scaleImageToCanvas(img, maxDim, quality);
+  return {
+    id: newImageId(),
+    name: file.name || 'image',
+    dataUrl: result.dataUrl,
+    thumbUrl: makeThumb(result.canvas),
+    width: result.width,
+    height: result.height,
+    origWidth: result.origWidth,
+    origHeight: result.origHeight,
+    scaled: result.scaled,
+  };
+}
+
+async function addImages(files) {
+  const list = Array.from(files || []);
+  const remaining = Math.max(0, MAX_IMAGES_PER_MESSAGE - attachedImages.length);
+  if (remaining <= 0) {
+    toast(`Maximum ${MAX_IMAGES_PER_MESSAGE} images per message`);
+    return;
+  }
+  const accepted = list.slice(0, remaining);
+  if (list.length > accepted.length) {
+    toast(`Only the first ${accepted.length} image(s) were added (max ${MAX_IMAGES_PER_MESSAGE})`);
+  }
+  const cfg = getChatConfig(getActive());
+  for (const file of accepted) {
+    try {
+      const entry = await processImageFile(file, cfg);
+      attachedImages.push(entry);
+    } catch (err) {
+      console.warn('image attach failed:', err);
+      toast(`Could not attach ${file.name || 'image'}`);
+    }
+  }
+  renderImagePreview();
+  updateSendBtn();
+}
+
+function removeImage(id) {
+  attachedImages = attachedImages.filter(img => img.id !== id);
+  renderImagePreview();
+  updateSendBtn();
+}
+
+function clearAttachedImages() {
+  attachedImages = [];
+  renderImagePreview();
+  updateSendBtn();
+}
+
+// Builds a thumbnail element entirely via DOM APIs (no innerHTML) so that
+// untrusted fields (name, dimensions) can never break out into markup.
+function buildImageThumbEl(img, { withRemove = false, onRemove = null } = {}) {
+  const t = document.createElement('div');
+  t.className = 'image-thumb';
+
+  const w = Number.isFinite(Number(img.width)) ? Number(img.width) : 0;
+  const h = Number.isFinite(Number(img.height)) ? Number(img.height) : 0;
+  const ow = Number.isFinite(Number(img.origWidth)) ? Number(img.origWidth) : 0;
+  const oh = Number.isFinite(Number(img.origHeight)) ? Number(img.origHeight) : 0;
+  const name = typeof img.name === 'string' ? img.name.slice(0, 200) : 'image';
+  t.title = img.scaled
+    ? `${name} (scaled from ${ow}×${oh})`
+    : `${name} (${w}×${h})`;
+
+  const im = document.createElement('img');
+  im.src = img.thumbUrl; // caller must guarantee isSafeImageDataUrl()
+  im.alt = '';
+  t.appendChild(im);
+
+  if (withRemove) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'remove';
+    btn.setAttribute('aria-label', 'Remove image');
+    btn.title = 'Remove';
+    btn.textContent = '×';
+    btn.addEventListener('click', () => onRemove && onRemove());
+    t.appendChild(btn);
+  }
+
+  if (img.scaled) {
+    const badge = document.createElement('span');
+    badge.className = 'scaled-badge';
+    badge.textContent = 'scaled';
+    t.appendChild(badge);
+  }
+
+  return t;
+}
+
+function renderImagePreview() {
+  if (!imagePreviewEl) return;
+  if (!attachedImages.length) {
+    imagePreviewEl.classList.remove('has-images');
+    imagePreviewEl.innerHTML = '';
+    return;
+  }
+  imagePreviewEl.classList.add('has-images');
+  imagePreviewEl.innerHTML = '';
+  for (const img of attachedImages) {
+    if (!isSafeImageDataUrl(img.thumbUrl)) continue;
+    imagePreviewEl.appendChild(
+      buildImageThumbEl(img, { withRemove: true, onRemove: () => removeImage(img.id) })
+    );
+  }
+}
+
+// ---------- Marked config ----------
+marked.setOptions({
+  breaks: true,
+  gfm: true,
+});
+
+const renderer = new marked.Renderer();
+
+renderer.link = function(href, title, text) {
+  const token = (typeof href === 'object' && href !== null) ? href : { href, title, text };
+  let linkHref = token.href || '';
+  let linkTitle = token.title || '';
+  let linkText = token.text || linkHref;
+
+  let safeHref = String(linkHref).trim();
+  const lower = safeHref.toLowerCase().replace(/[\s-]+/g, '');
+  if (!safeHref || lower.startsWith('javascript:') || lower.startsWith('data:') || lower.startsWith('vbscript:')) {
+    safeHref = '#';
+  }
+  const titleAttr = linkTitle ? ` title="${escapeHtml(linkTitle)}"` : '';
+  return `<a href="${escapeHtml(safeHref)}" target="_blank" rel="noopener noreferrer"${titleAttr}>${escapeHtml(linkText)}</a>`;
+};
+
+renderer.code = function(code, language) {
+  let text, lang;
+  if (typeof code === 'object' && code !== null) {
+    text = code.text;
+    lang = code.lang || '';
+  } else {
+    text = code;
+    lang = language || '';
+  }
+  lang = String(lang).split(' ')[0];
+  let highlighted;
+  try {
+    if (lang && hljs.getLanguage(lang)) {
+      highlighted = hljs.highlight(text, { language: lang }).value;
+    } else {
+      highlighted = hljs.highlightAuto(text).value;
+    }
+  } catch (e) {
+    highlighted = escapeHtml(text);
+  }
+  // SECURITY: no id attributes here — copy buttons are resolved relatively
+  // (closest('.code-block')) so sanitized content can never clobber lookups.
+  const display = lang || 'code';
+  return `<div class="code-block">
+    <div class="code-head">
+      <span class="code-lang">${escapeHtml(display)}</span>
+      <button type="button" class="copy-btn" aria-label="Copy code">Copy</button>
+    </div>
+    <pre><code class="hljs">${highlighted}</code></pre>
+  </div>`;
+};
+marked.use({ renderer });
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// SECURITY: only allow the exact classes our own renderer emits. This stops
+// model output from reusing app classes (modal-overlay, settings-btn, …)
+// for UI-redress / phishing overlays.
+const ALLOWED_CLASS_RE = /^(hljs(-[\w]+)?|code-block|code-head|code-lang|copy-btn)$/;
+DOMPurify.addHook('afterSanitizeAttributes', (node) => {
+  if (node.hasAttribute && node.hasAttribute('class')) {
+    const kept = node.getAttribute('class').split(/\s+/).filter(c => ALLOWED_CLASS_RE.test(c));
+    if (kept.length) node.setAttribute('class', kept.join(' '));
+    else node.removeAttribute('class');
+  }
+});
+
+function renderMarkdown(text) {
+  try {
+    const rawHtml = marked.parse(text);
+    return DOMPurify.sanitize(rawHtml, {
+      ADD_TAGS: ['button'],
+      ADD_ATTR: ['target', 'rel', 'aria-label'],
+      // img: remote images would leak viewer IP; svg/math: mXSS surface.
+      FORBID_TAGS: ['style', 'form', 'input', 'textarea', 'select', 'iframe', 'object', 'embed', 'script', 'img', 'svg', 'math', 'video', 'audio', 'source'],
+      // id/name: prevents DOM clobbering of app element lookups.
+      FORBID_ATTR: ['style', 'id', 'name', 'srcset', 'formaction', 'onerror', 'onload', 'onclick', 'onmouseover']
+    });
+  } catch (e) {
+    return '<p>' + escapeHtml(text) + '</p>';
+  }
+}
+
+function wireCopyButtons(root) {
+  root.querySelectorAll('.copy-btn:not([data-wired])').forEach(btn => {
+    btn.dataset.wired = '1';
+    btn.addEventListener('click', async () => {
+      // Resolve the code element relative to the button — no global id lookup.
+      const block = btn.closest('.code-block');
+      const codeEl = block ? block.querySelector('pre code') : null;
+      if (!codeEl) return;
+      try {
+        await navigator.clipboard.writeText(codeEl.textContent);
+        btn.textContent = 'Copied';
+        btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);
+      } catch (err) {
+        toast('Copy failed');
+      }
+    });
+  });
+}
+
+// ---------- Conversations ----------
+async function newConversation() {
+  pendingEditOriginalNodeId = null;
+  const conv = {
+    id: uid(),
+    title: 'New conversation',
+    messages: { __root__: createRootNode() },
+    systemPrompt: '',
+    presetId: state.config.activePresetId || null,
+    createdAt: Date.now()
+  };
+  state.conversations.unshift(conv);
+  state.activeId = conv.id;
+  await saveAppState();
+  await saveConversation(conv);
+  renderSidebar();
+  renderMessages();
+  inputEl.focus();
+}
+
+function getActive() {
+  return state.conversations.find(c => c.id === state.activeId);
+}
+
+async function deleteConversation(id) {
+  if (isStreaming) { toast('Stop the current stream first'); return; }
+  pendingEditOriginalNodeId = null;
+  state.conversations = state.conversations.filter(c => c.id !== id);
+  if (state.activeId === id) {
+    state.activeId = state.conversations[0]?.id || null;
+    if (!state.activeId) {
+      await newConversation();
+      return;
+    }
+  }
+  try { await dbDelete('conversations', id); } catch (e) { console.warn(e); }
+  await saveAppState();
+  renderSidebar();
+  renderMessages();
+}
+
+async function setActive(id) {
+  if (isStreaming) return;
+  pendingEditOriginalNodeId = null;
+  state.activeId = id;
+  const active = getActive();
+  if (active) {
+    state.sidebarExpandedMonths.add(getMonthKey(new Date(active.createdAt || Date.now())));
+  }
+  await saveAppState();
+  renderSidebar();
+  renderMessages();
+}
+
+// ---------- Sidebar render ----------
+function renderSidebar() {
+  convList.innerHTML = '';
+  const active = getActive();
+  const activeMonthKey = active ? getMonthKey(new Date(active.createdAt || Date.now())) : null;
+
+  if (state.conversations.length === 0) {
+    convList.innerHTML = '<div style="padding:14px 12px;color:var(--text-faint);font-size:12px;">No conversations yet.</div>';
+    topbarTitle.textContent = 'New conversation';
+    updateExportBtn();
+    return;
+  }
+
+  const sorted = [...state.conversations].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const groups = [];
+  for (const c of sorted) {
+    const key = getMonthKey(new Date(c.createdAt || Date.now()));
+    if (!groups.length || groups[groups.length - 1].key !== key) {
+      groups.push({ key, convs: [] });
+    }
+    groups[groups.length - 1].convs.push(c);
+  }
+
+  const now = new Date();
+  const currentKey = getMonthKey(now);
+  const lastKey = getMonthKey(new Date(now.getFullYear(), now.getMonth() - 1, 1));
+
+  for (const g of groups) {
+    const expanded = state.sidebarExpandedMonths.has(g.key) || g.key === activeMonthKey;
+    const header = document.createElement('div');
+    header.className = 'conv-month-header' + (expanded ? '' : ' collapsed');
+
+    const label = document.createElement('span');
+    label.textContent = getMonthLabel(g.key, currentKey, lastKey);
+    const count = document.createElement('span');
+    count.className = 'conv-month-count';
+    count.textContent = g.convs.length;
+    const chev = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    chev.setAttribute('class', 'chevron');
+    chev.setAttribute('viewBox', '0 0 24 24');
+    chev.setAttribute('fill', 'none');
+    chev.setAttribute('stroke', 'currentColor');
+    chev.setAttribute('stroke-width', '2.5');
+    const chevPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    chevPath.setAttribute('d', 'M6 9l6 6 6-6');
+    chev.appendChild(chevPath);
+    header.appendChild(label);
+    header.appendChild(count);
+    header.appendChild(chev);
+
+    header.addEventListener('click', () => toggleMonth(g.key));
+    convList.appendChild(header);
+
+    if (expanded) {
+      for (const c of g.convs) {
+        const div = document.createElement('div');
+        div.className = 'conv-item' + (c.id === state.activeId ? ' active' : '');
+
+        const dot = document.createElement('span');
+        dot.className = 'dot';
+        const title = document.createElement('span');
+        title.className = 'title';
+        title.textContent = c.title || 'New conversation';
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'del';
+        del.title = 'Delete';
+        del.setAttribute('aria-label', 'Delete conversation');
+        del.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>';
+
+        div.appendChild(dot);
+        div.appendChild(title);
+        div.appendChild(del);
+
+        div.addEventListener('click', (e) => {
+          if (e.target.closest('.del')) {
+            e.stopPropagation();
+            deleteConversation(c.id);
+          } else {
+            setActive(c.id);
+            closeSidebarMobile();
+          }
+        });
+        convList.appendChild(div);
+      }
+    }
+  }
+
+  topbarTitle.textContent = active?.title || 'New conversation';
+  updateExportBtn();
+}
+
+async function toggleMonth(key) {
+  if (state.sidebarExpandedMonths.has(key)) state.sidebarExpandedMonths.delete(key);
+  else state.sidebarExpandedMonths.add(key);
+  await saveAppState();
+  renderSidebar();
+}
+
+function ensureSidebarExpandedMonths() {
+  if (!(state.sidebarExpandedMonths instanceof Set)) {
+    state.sidebarExpandedMonths = new Set(
+      Array.isArray(state.sidebarExpandedMonths) ? state.sidebarExpandedMonths : []
+    );
+  }
+  state.sidebarExpandedMonths.add(getMonthKey(new Date()));
+}
+
+// ---------- Messages render ----------
+function renderMessages() {
+  const conv = getActive();
+  const path = getVisiblePath(conv);
+  if (!conv || path.length === 0) {
+    renderWelcome();
+    updateExportBtn();
+    renderCost();
+    return;
+  }
+  messagesInner.innerHTML = '';
+
+  if (conv.systemPrompt && conv.systemPrompt.trim()) {
+    const sysEl = document.createElement('div');
+    sysEl.className = 'msg system';
+
+    const head = document.createElement('div');
+    head.className = 'msg-head';
+    const avatar = document.createElement('div');
+    avatar.className = 'msg-avatar';
+    avatar.textContent = 'S';
+    const role = document.createElement('div');
+    role.className = 'msg-role';
+    role.textContent = 'System';
+    head.appendChild(avatar);
+    head.appendChild(role);
+
+    const content = document.createElement('div');
+    content.className = 'msg-content';
+    content.textContent = conv.systemPrompt;
+
+    sysEl.appendChild(head);
+    sysEl.appendChild(content);
+    messagesInner.appendChild(sysEl);
+  }
+
+  path.forEach((node, idx) => {
+    messagesInner.appendChild(buildMsgEl(node, idx, conv));
+  });
+  scrollToBottom(true);
+  updateExportBtn();
+  renderCost();
+}
+
+function renderWelcome() {
+  messagesInner.innerHTML = `
+    <div class="welcome">
+      <h1>Begin a <em>conversation.</em></h1>
+      <p>A minimal console for any OpenAI-compatible LLM. Streamed, complete, never truncated.</p>
+      <div class="suggestions">
+        <button type="button" class="suggestion" data-prompt="Write a Python script that watches a directory and prints any new files added, with graceful shutdown on Ctrl+C.">
+          <strong>File watcher</strong>A Python script with graceful shutdown
+        </button>
+        <button type="button" class="suggestion" data-prompt="Explain the difference between async/await and threads, with a concrete example in TypeScript.">
+          <strong>Async vs threads</strong>When to use which, with examples
+        </button>
+        <button type="button" class="suggestion" data-prompt="Refactor this function for readability and explain your changes:\n\nfunction f(a){let r=[];for(let i=0;i<a.length;i++){if(a[i]%2==0){r.push(a[i]*2)}}return r}">
+          <strong>Refactor my code</strong>Paste a function, get a cleaner version
+        </button>
+        <button type="button" class="suggestion" data-prompt="Draft a professional but warm out-of-office email for a 2-week vacation, mentioning limited email access.">
+          <strong>Out-of-office email</strong>Warm, professional, 2-week
+        </button>
+      </div>
+    </div>`;
+  messagesInner.querySelectorAll('.suggestion').forEach(b => {
+    b.addEventListener('click', () => {
+      pendingEditOriginalNodeId = null;
+      inputEl.value = b.dataset.prompt;
+      autoGrow();
+      updateSendBtn();
+      inputEl.focus();
+    });
+  });
+}
+
+function buildMsgEl(node, idx, conv) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ' + node.role;
+  wrap.dataset.idx = idx;
+  wrap.dataset.id = node.id;
+  const initial = node.role === 'user' ? 'U' : 'A';
+  const roleLabel = node.role === 'user' ? 'You' : 'Assistant';
+  let contentHtml;
+  if (node.role === 'user') {
+    contentHtml = escapeHtml(node.content || '');
+  } else {
+    contentHtml = renderMarkdown(node.content || '');
+  }
+
+  let reasoningHtml = '';
+  if (node.role === 'assistant' && node.reasoning && node.reasoning.trim()) {
+    reasoningHtml = `
+      <div class="msg-reasoning" style="display:block;">
+        <div class="msg-reasoning-label">Reasoning</div>
+        ${escapeHtml(node.reasoning)}
+      </div>`;
+  }
+
+  const parent = conv.messages[node.parentId];
+  const hasVersions = parent && parent.children.length > 1;
+  const versionIndex = parent ? parent.selectedChildIndex : 0;
+  const versionSwitcher = hasVersions ? `
+    <div class="branch-switcher" title="Versions of this message">
+      <button type="button" class="msg-action" data-act="prev-version">‹</button>
+      <span class="branch-label">${versionIndex + 1} / ${parent.children.length}</span>
+      <button type="button" class="msg-action" data-act="next-version">›</button>
+    </div>
+  ` : '';
+
+  const hasResponses = node.role === 'user' && node.children.length > 1;
+  const responseSwitcher = hasResponses ? `
+    <div class="branch-switcher" title="Regenerated responses">
+      <button type="button" class="msg-action" data-act="prev-response">‹</button>
+      <span class="branch-label">${node.selectedChildIndex + 1} / ${node.children.length}</span>
+      <button type="button" class="msg-action" data-act="next-response">›</button>
+    </div>
+  ` : '';
+
+  const tokenCountHtml = (node.role === 'assistant' && node.usage && Number.isFinite(node.usage.prompt_tokens))
+    ? `<span class="token-count" title="Input / output tokens">${node.usage.prompt_tokens} / ${node.usage.completion_tokens || 0} tok</span>`
+    : '';
+
+  wrap.innerHTML = `
+    <div class="msg-head">
+      <div class="msg-avatar">${initial}</div>
+      <div class="msg-role">${roleLabel}${tokenCountHtml}${versionSwitcher}</div>
+      <div class="msg-actions">
+        <button type="button" class="msg-action" data-act="copy" aria-label="Copy" title="Copy">
+          <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="9" y="9" width="13" height="13" rx="2"/>
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+          </svg>
+        </button>
+        ${node.role === 'user' ? `
+          <button type="button" class="msg-action" data-act="edit" aria-label="Edit" title="Edit">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>
+            </svg>
+          </button>
+          <button type="button" class="msg-action" data-act="regenerate" aria-label="Regenerate" title="Regenerate response">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/>
+              <path d="M21 3v5h-5"/>
+            </svg>
+          </button>
+          ${responseSwitcher}
+        ` : ''}
+      </div>
+    </div>
+    ${reasoningHtml}
+    <div class="msg-content">${contentHtml}</div>
+  `;
+
+  // Image thumbnails: built via DOM APIs with validated fields only.
+  if (node.role === 'user' && Array.isArray(node.images)) {
+    const usable = node.images.filter(img => img && isSafeImageDataUrl(img.thumbUrl));
+    if (usable.length) {
+      const strip = document.createElement('div');
+      strip.className = 'msg-images';
+      for (const img of usable) {
+        strip.appendChild(buildImageThumbEl(img));
+      }
+      const contentEl = wrap.querySelector('.msg-content');
+      wrap.insertBefore(strip, contentEl);
+    }
+  }
+
+  wrap.querySelector('[data-act="copy"]')?.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(node.content);
+      toast('Copied to clipboard');
+    } catch (err) { toast('Copy failed'); }
+  });
+  wrap.querySelector('[data-act="edit"]')?.addEventListener('click', () => {
+    if (isStreaming) { toast('Stop the current stream first'); return; }
+    inputEl.value = node.content;
+    attachedImages = (node.images || [])
+      .filter(img => img && isSafeImageDataUrl(img.dataUrl) && isSafeImageDataUrl(img.thumbUrl))
+      .map(img => ({...img}));
+    renderImagePreview();
+    autoGrow();
+    inputEl.focus();
+    pendingEditOriginalNodeId = node.id;
+  });
+  wrap.querySelector('[data-act="regenerate"]')?.addEventListener('click', () => {
+    if (isStreaming) { toast('Stop the current stream first'); return; }
+    regenerateMessage(node.id);
+  });
+  wrap.querySelector('[data-act="prev-version"]')?.addEventListener('click', () => switchBranch(node.id, -1, 'version'));
+  wrap.querySelector('[data-act="next-version"]')?.addEventListener('click', () => switchBranch(node.id, 1, 'version'));
+  wrap.querySelector('[data-act="prev-response"]')?.addEventListener('click', () => switchBranch(node.id, -1, 'response'));
+  wrap.querySelector('[data-act="next-response"]')?.addEventListener('click', () => switchBranch(node.id, 1, 'response'));
+  wireCopyButtons(wrap);
+  return wrap;
+}
+
+function scrollToBottom(instant = false) {
+  messagesEl.scrollTo({ top: messagesEl.scrollHeight, behavior: instant ? 'auto' : 'smooth' });
+}
+
+// ---------- Auto-grow textarea ----------
+function autoGrow() {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + 'px';
+}
+
+function updateSendBtn() {
+  const hasText = inputEl.value.trim().length > 0;
+  const hasImages = attachedImages.length > 0;
+  sendBtn.disabled = !(hasText || hasImages) && !isStreaming;
+  sendBtn.setAttribute('aria-label', isStreaming ? 'Stop generation' : 'Send message');
+  if (isStreaming) {
+    sendBtn.classList.add('stop');
+    sendBtn.disabled = false;
+    sendBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
+  } else {
+    sendBtn.classList.remove('stop');
+    sendBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
+  }
+}
+
+function updateExportBtn() {
+  exportChatBtn.disabled = !getActive();
+}
+
+// ---------- Export ----------
+function sanitizeFilename(name) {
+  return (name || 'chat')
+    .replace(/[^a-z0-9]/gi, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 40) || 'chat';
+}
+
+function stripImageData(payload) {
+  const clone = JSON.parse(JSON.stringify(payload));
+  const strip = (conv) => {
+    for (const m of Object.values(conv.messages || {})) {
+      delete m.images;
+    }
+  };
+  if (clone.conversation) strip(clone.conversation);
+  if (clone.conversations) clone.conversations.forEach(strip);
+  return clone;
+}
+
+function downloadJSON(data, filename) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 0);
+}
+
+function exportCurrentChat() {
+  const conv = getActive();
+  if (!conv) { toast('No chat to export'); return; }
+  const date = new Date().toISOString().slice(0, 10);
+  const safe = sanitizeFilename(conv.title || 'chat');
+  downloadJSON(stripImageData({
+    exportedAt: new Date().toISOString(),
+    app: 'Drea Chat',
+    version: 1,
+    conversation: conv
+  }), `drea-chat-${safe}-${date}.json`);
+  toast('Chat exported');
+}
+
+function exportAllChats() {
+  if (!state.conversations.length) { toast('No chats to export'); return; }
+  const date = new Date().toISOString().slice(0, 10);
+  downloadJSON(stripImageData({
+    exportedAt: new Date().toISOString(),
+    app: 'Drea Chat',
+    version: 1,
+    conversations: state.conversations
+  }), `drea-chats-${date}.json`);
+  toast('All chats exported');
+}
+
+// ---------- Import ----------
+
+// Keys that must never be used as own-property names on a plain object.
+const FORBIDDEN_OBJ_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+// Sanitize one imported image entry; returns null if unusable.
+function sanitizeImportedImage(img) {
+  if (!img || typeof img !== 'object') return null;
+  if (!isSafeImageDataUrl(img.dataUrl)) return null;
+  const num = (v) => {
+    const n = Math.floor(Number(v));
+    return Number.isFinite(n) && n >= 0 && n <= 100000 ? n : 0;
+  };
+  return {
+    id: uid(),
+    name: typeof img.name === 'string' ? img.name.slice(0, 200) : 'image',
+    dataUrl: img.dataUrl,
+    // Only keep a thumbnail if it is itself a safe data URL; otherwise fall
+    // back to the (validated) full image so nothing attacker-controlled is
+    // ever assigned to an <img src>.
+    thumbUrl: isSafeImageDataUrl(img.thumbUrl) ? img.thumbUrl : img.dataUrl,
+    width: num(img.width),
+    height: num(img.height),
+    origWidth: num(img.origWidth),
+    origHeight: num(img.origHeight),
+    scaled: img.scaled === true,
+  };
+}
+
+function normalizeConversation(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = uid(); // never trust imported conversation ids
+  const title = typeof raw.title === 'string' ? raw.title.slice(0, 200) : 'Imported chat';
+  const systemPrompt = typeof raw.systemPrompt === 'string' ? raw.systemPrompt : '';
+  const presetId = null; // imported preset references are meaningless locally
+
+  let messages = {};
+
+  if (Array.isArray(raw.messages)) {
+    messages = migrateFlatMessagesToTree(raw.messages).messages;
+  } else if (raw.messages && typeof raw.messages === 'object') {
+    // Pass 1: validate nodes and assign fresh, locally-generated ids.
+    const idMap = new Map();
+    const pending = [];
+    for (const key of Object.keys(raw.messages)) {
+      if (FORBIDDEN_OBJ_KEYS.has(key)) continue;
+      const m = raw.messages[key];
+      if (!m || typeof m !== 'object' || typeof m.content !== 'string') continue;
+
+      const oldId = (typeof m.id === 'string' && m.id) ? m.id : key;
+      const isRoot = oldId === '__root__' || key === '__root__';
+      const newId = isRoot ? '__root__' : uid();
+      if (!idMap.has(oldId)) idMap.set(oldId, newId);
+      if (key !== oldId && !idMap.has(key)) idMap.set(key, newId);
+
+      pending.push({ m, newId, isRoot });
+    }
+
+    // Pass 2: build nodes with remapped references.
+    for (const { m, newId, isRoot } of pending) {
+      const role = isRoot ? 'root'
+        : (m.role === 'user' ? 'user'
+        : (m.role === 'assistant' ? 'assistant' : 'assistant'));
+
+      const images = Array.isArray(m.images)
+        ? m.images.map(sanitizeImportedImage).filter(Boolean)
+        : [];
+
+      messages[newId] = {
+        id: newId,
+        role,
+        content: typeof m.content === 'string' ? m.content : '',
+        reasoning: typeof m.reasoning === 'string' ? m.reasoning : '',
+        images,
+        parentId: null, // fixed below
+        children: [],   // fixed below
+        selectedChildIndex: Number.isFinite(m.selectedChildIndex) ? Math.max(0, Math.floor(m.selectedChildIndex)) : 0,
+        createdAt: Number.isFinite(m.createdAt) && m.createdAt > 0 ? m.createdAt : Date.now(),
+        usage: m.usage && typeof m.usage === 'object' ? {
+          prompt_tokens: Math.max(0, Math.floor(Number(m.usage.prompt_tokens)) || 0),
+          completion_tokens: Math.max(0, Math.floor(Number(m.usage.completion_tokens)) || 0),
+          total_tokens: Math.max(0, Math.floor(Number(m.usage.total_tokens)) || 0),
+        } : undefined,
+      };
+
+      // Remap parent
+      if (!isRoot && typeof m.parentId === 'string' && idMap.has(m.parentId)) {
+        messages[newId].parentId = idMap.get(m.parentId);
+      }
+      // Remap children (deferred: children may not exist yet, store raw list)
+      messages[newId].__rawChildren = Array.isArray(m.children) ? m.children : [];
+    }
+
+    // Pass 3: resolve children now that all ids exist.
+    for (const node of Object.values(messages)) {
+      const rawKids = node.__rawChildren || [];
+      delete node.__rawChildren;
+      node.children = rawKids
+        .filter(k => typeof k === 'string' && idMap.has(k))
+        .map(k => idMap.get(k))
+        .filter(kidId => kidId !== node.id && messages[kidId]);
+      if (node.selectedChildIndex >= node.children.length) {
+        node.selectedChildIndex = Math.max(0, node.children.length - 1);
+      }
+    }
+  }
+
+  const conv = { id, title, systemPrompt, presetId, messages };
+  ensureRootNode(conv);
+  if (Number.isFinite(raw.createdAt) && raw.createdAt > 0) conv.createdAt = raw.createdAt;
+  ensureConvCreatedAt(conv);
+  return conv;
+}
+
+function extractConversationsFromImport(data) {
+  if (!data || typeof data !== 'object') return [];
+  if (data.conversation && typeof data.conversation === 'object') {
+    const conv = normalizeConversation(data.conversation);
+    return conv ? [conv] : [];
+  }
+  if (Array.isArray(data.conversations)) {
+    return data.conversations.map(normalizeConversation).filter(Boolean);
+  }
+  if (Array.isArray(data)) {
+    return data.map(normalizeConversation).filter(Boolean);
+  }
+  return [];
+}
+
+function importChats(file) {
+  pendingEditOriginalNodeId = null;
+  if (file.size > 200 * 1024 * 1024) {
+    toast('File too large to import');
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = async (e) => {
+    let json;
+    try {
+      json = JSON.parse(e.target.result);
+    } catch (err) {
+      toast('Invalid JSON file');
+      return;
+    }
+    const imported = extractConversationsFromImport(json);
+    if (!imported.length) {
+      toast('No valid conversations found');
+      return;
+    }
+
+    const existingCount = state.conversations.length;
+    let mode;
+    if (existingCount === 0) {
+      mode = 'replace';
+    } else {
+      mode = confirm(
+        `Found ${imported.length} conversation${imported.length === 1 ? '' : 's'}.\n\n` +
+        `Click OK to MERGE with your ${existingCount} existing chat${existingCount === 1 ? '' : 's'}.\n` +
+        `Click Cancel to REPLACE all existing chats with the imported ones.`
+      ) ? 'merge' : 'replace';
+    }
+
+    if (mode === 'replace') {
+      state.conversations = imported;
+      state.activeId = imported[0].id;
+      try { await dbClear('conversations'); } catch (err) { console.warn(err); }
+    } else {
+      // Imported ids are freshly generated, so collisions are impossible.
+      state.conversations = [...imported, ...state.conversations];
+      if (!state.activeId) {
+        state.activeId = state.conversations[0].id;
+      }
+    }
+
+    const activeConv = state.conversations.find(c => c.id === state.activeId);
+    if (activeConv) {
+      state.sidebarExpandedMonths.add(getMonthKey(new Date(activeConv.createdAt || Date.now())));
+    }
+
+    for (const c of state.conversations) {
+      await saveConversation(c);
+    }
+    await saveAppState();
+
+    renderSidebar();
+    renderMessages();
+    toast(`Imported ${imported.length} chat${imported.length === 1 ? '' : 's'}`);
+  };
+  reader.onerror = () => toast('Failed to read file');
+  reader.readAsText(file);
+}
+
+// ---------- Streaming chat completion ----------
+let isStreaming = false;
+let abortController = null;
+
+async function switchBranch(nodeId, direction, type) {
+  if (isStreaming) return;
+  pendingEditOriginalNodeId = null;
+  const conv = getActive();
+  const node = conv.messages[nodeId];
+  if (!node) return;
+
+  if (type === 'version') {
+    const parent = conv.messages[node.parentId];
+    if (!parent || parent.children.length <= 1) return;
+    parent.selectedChildIndex = (parent.selectedChildIndex + direction + parent.children.length) % parent.children.length;
+  } else if (type === 'response') {
+    if (node.children.length <= 1) return;
+    node.selectedChildIndex = (node.selectedChildIndex + direction + node.children.length) % node.children.length;
+  } else {
+    return;
+  }
+
+  await saveConversation(conv);
+  renderMessages();
+  const el = messagesInner.querySelector(`.msg[data-id="${CSS.escape(nodeId)}"]`);
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+async function regenerateMessage(userNodeId) {
+  const conv = getActive();
+  const chatConfig = getChatConfig(conv);
+
+  if (chatConfig.apiKeyEncrypted && !vaultPassword) {
+    const unlocked = await ensureVaultUnlocked();
+    if (!unlocked) {
+      toast('Vault locked — API key unavailable');
+      return;
+    }
+  }
+
+  pendingEditOriginalNodeId = null;
+  const userNode = conv.messages[userNodeId];
+  if (!userNode || userNode.role !== 'user') return;
+
+  if (conv.presetId !== state.config.activePresetId) {
+    conv.presetId = state.config.activePresetId;
+    conv.systemPrompt = state.config.systemPrompt || '';
+    await saveConversation(conv);
+  }
+
+  const assistantNode = createMessageNode('assistant', '', userNodeId);
+  conv.messages[assistantNode.id] = assistantNode;
+  userNode.children.push(assistantNode.id);
+  userNode.selectedChildIndex = userNode.children.length - 1;
+
+  await saveConversation(conv);
+  renderMessages();
+  streamAssistantResponse(conv, assistantNode, chatConfig);
+}
+
+async function sendMessage() {
+  let conv = getActive();
+  if (!conv) { await newConversation(); conv = getActive(); }
+
+  const chatConfig = getChatConfig(conv);
+  if (chatConfig.apiKeyEncrypted && !vaultPassword) {
+    const unlocked = await ensureVaultUnlocked();
+    if (!unlocked) {
+      toast('Vault locked — API key unavailable');
+      return;
+    }
+  }
+
+  const text = inputEl.value.trim();
+  const imgs = attachedImages.slice();
+  if ((!text && !imgs.length) || isStreaming) return;
+
+  if (conv.presetId !== state.config.activePresetId) {
+    conv.presetId = state.config.activePresetId;
+    conv.systemPrompt = state.config.systemPrompt || '';
+    await saveConversation(conv);
+  }
+
+  if (!chatConfig.model) {
+    toast('Please set a model name in Settings');
+    openSettings();
+    return;
+  }
+
+  const root = conv.messages.__root__;
+  const isEmptyConv = !root || root.children.length === 0;
+  if (isEmptyConv) {
+    conv.systemPrompt = chatConfig.systemPrompt || '';
+  }
+
+  const snapshotImages = (list) => list.map(img => ({
+    id: img.id, name: img.name, dataUrl: img.dataUrl, thumbUrl: img.thumbUrl,
+    width: img.width, height: img.height, origWidth: img.origWidth, origHeight: img.origHeight, scaled: img.scaled,
+  }));
+
+  let userNode;
+  if (pendingEditOriginalNodeId && conv.messages[pendingEditOriginalNodeId]) {
+    const original = conv.messages[pendingEditOriginalNodeId];
+    const parentId = original.parentId;
+    userNode = createMessageNode('user', text, parentId, { images: snapshotImages(imgs) });
+    conv.messages[userNode.id] = userNode;
+    const parent = conv.messages[parentId];
+    parent.children.push(userNode.id);
+    parent.selectedChildIndex = parent.children.length - 1;
+    pendingEditOriginalNodeId = null;
+  } else {
+    const parent = getCurrentLeaf(conv) || root;
+    userNode = createMessageNode('user', text, parent.id, { images: snapshotImages(imgs) });
+    conv.messages[userNode.id] = userNode;
+    parent.children.push(userNode.id);
+    parent.selectedChildIndex = parent.children.length - 1;
+  }
+
+  if (userNode.parentId === '__root__' && root.children.length === 1) {
+    conv.createdAt = userNode.createdAt;
+    const titleSrc = text || (imgs.length === 1 ? `Image: ${imgs[0].name}` : `${imgs.length} images`);
+    conv.title = titleSrc.slice(0, 48) + (titleSrc.length > 48 ? '…' : '');
+  }
+  if (!conv.createdAt) conv.createdAt = userNode.createdAt;
+
+  inputEl.value = '';
+  clearAttachedImages();
+  autoGrow();
+  updateSendBtn();
+
+  await saveConversation(conv);
+  renderSidebar();
+
+  const assistantNode = createMessageNode('assistant', '', userNode.id);
+  conv.messages[assistantNode.id] = assistantNode;
+  userNode.children.push(assistantNode.id);
+  userNode.selectedChildIndex = 0;
+
+  await saveConversation(conv);
+  renderMessages();
+  await streamAssistantResponse(conv, assistantNode, chatConfig);
+}
+
+async function streamAssistantResponse(conv, assistantNode, chatConfig) {
+  if (!chatConfig) chatConfig = getChatConfig(conv);
+
+  const assistantEl = messagesInner.querySelector(`.msg[data-id="${CSS.escape(assistantNode.id)}"]`);
+  if (!assistantEl) {
+    isStreaming = false;
+    updateSendBtn();
+    return;
+  }
+  const contentEl = assistantEl.querySelector('.msg-content');
+  contentEl.innerHTML = '<span class="cursor"></span>';
+
+  const reasoningEl = document.createElement('div');
+  reasoningEl.className = 'msg-reasoning';
+  reasoningEl.innerHTML = '<div class="msg-reasoning-label">Reasoning</div>';
+  contentEl.parentNode.insertBefore(reasoningEl, contentEl);
+
+  scrollToBottom();
+
+  let userScrolledUp = false;
+  const onScroll = () => {
+    const nearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
+    userScrolledUp = !nearBottom;
+  };
+  messagesEl.addEventListener('scroll', onScroll, { passive: true });
+
+  // Securely resolve the API key right before making the request
+  let effectiveApiKey = chatConfig.apiKey;
+  if (chatConfig.apiKeyEncrypted) {
+    if (!vaultPassword) {
+      toast('Vault locked — API key unavailable');
+      isStreaming = false;
+      updateSendBtn();
+      return;
+    }
+    try {
+      effectiveApiKey = await decryptSecret(chatConfig.apiKeyEncrypted, vaultPassword);
+    } catch (e) {
+      toast('Failed to decrypt API key');
+      isStreaming = false;
+      updateSendBtn();
+      return;
+    }
+  }
+
+  const endpoint = (chatConfig.endpoint || DEFAULTS.endpoint).replace(/\/+$/, '');
+
+  // Defense in depth: refuse to send credentials to cleartext remote hosts.
+  if (!isEndpointAllowed(endpoint)) {
+    contentEl.innerHTML = '';
+    const errEl = document.createElement('div');
+    errEl.className = 'error-msg';
+    errEl.textContent = 'Blocked: endpoint must use HTTPS (plain HTTP is only allowed for localhost).';
+    contentEl.appendChild(errEl);
+    reasoningEl.style.display = 'none';
+    messagesEl.removeEventListener('scroll', onScroll);
+    isStreaming = false;
+    updateSendBtn();
+    return;
+  }
+
+  const url = endpoint + '/chat/completions';
+
+  const body = {
+    model: chatConfig.model,
+    messages: [],
+    max_tokens: Number(chatConfig.maxTokens) || DEFAULTS.maxTokens,
+    stream: true,
+  };
+
+  if (conv.systemPrompt && conv.systemPrompt.trim()) {
+    body.messages.push({ role: 'system', content: conv.systemPrompt });
+  }
+
+  const visiblePath = getVisiblePath(conv);
+  const messagesForBody = visiblePath.slice(0, visiblePath.length - 1);
+  body.messages.push(...messagesForBody.map(node => {
+    if (node.role !== 'user') return { role: node.role, content: node.content };
+    if (!Array.isArray(node.images) || !node.images.length) {
+      return { role: node.role, content: node.content };
+    }
+    const parts = [];
+    if (node.content && node.content.length) parts.push({ type: 'text', text: node.content });
+    for (const img of node.images) {
+      if (img && isSafeImageDataUrl(img.dataUrl)) parts.push({ type: 'image_url', image_url: { url: img.dataUrl } });
+    }
+    if (!parts.length) parts.push({ type: 'text', text: node.content || '' });
+    return { role: node.role, content: parts };
+  }));
+
+  if (chatConfig.tempEnabled) body.temperature = Math.max(0, Math.min(2, Number(chatConfig.temperature) || DEFAULTS.temperature));
+  if (chatConfig.topPEnabled) body.top_p = Math.max(0, Math.min(1, Number(chatConfig.topP) || DEFAULTS.topP));
+  if (chatConfig.topKEnabled) body.top_k = Math.max(0, parseInt(chatConfig.topK, 10) || 0);
+  if (chatConfig.reasoningEffort && chatConfig.reasoningEffort !== 'none') body.reasoning_effort = chatConfig.reasoningEffort;
+  if (chatConfig.advancedSamplersEnabled) {
+    if (chatConfig.minPEnabled) body.min_p = Math.max(0, Math.min(1, Number(chatConfig.minP) || DEFAULTS.minP));
+    if (chatConfig.powerLawTargetEnabled) body.power_law_target = Math.max(0, Math.min(1, Number(chatConfig.powerLawTarget) || DEFAULTS.powerLawTarget));
+    if (chatConfig.powerLawDecayEnabled) body.power_law_decay = Math.max(0, Math.min(0.99, Number(chatConfig.powerLawDecay) || DEFAULTS.powerLawDecay));
+    if (chatConfig.adaptiveTargetEnabled) body.adaptive_target = Math.max(0, Math.min(1, Number(chatConfig.adaptiveTarget) || DEFAULTS.adaptiveTarget));
+    if (chatConfig.adaptiveDecayEnabled) body.adaptive_decay = Math.max(0, Math.min(0.99, Number(chatConfig.adaptiveDecay) || DEFAULTS.adaptiveDecay));
+  }
+
+  if (body.stream && chatConfig.requestStreamUsage !== false) {
+    body.stream_options = { include_usage: true };
+  }
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (effectiveApiKey) headers.Authorization = 'Bearer ' + effectiveApiKey;
+
+  abortController = new AbortController();
+
+  let fullText = '';
+  let fullReasoningText = '';
+  let renderPending = false;
+  let lastRenderText = '';
+  let lastRenderReasoning = '';
+  let usage = null;
+
+  const scheduleRender = () => {
+    if (renderPending) return;
+    renderPending = true;
+    requestAnimationFrame(() => {
+      renderPending = false;
+      const changed = fullText !== lastRenderText || fullReasoningText !== lastRenderReasoning;
+      if (!changed) return;
+      lastRenderText = fullText;
+      lastRenderReasoning = fullReasoningText;
+
+      if (fullReasoningText) {
+        reasoningEl.style.display = 'block';
+        const reasonScrollNearBottom = reasoningEl.scrollHeight - reasoningEl.scrollTop - reasoningEl.clientHeight < 40;
+        reasoningEl.innerHTML = '<div class="msg-reasoning-label">Reasoning</div>' + escapeHtml(fullReasoningText) + '<span class="cursor"></span>';
+        if (reasonScrollNearBottom) reasoningEl.scrollTop = reasoningEl.scrollHeight;
+      }
+
+      if (fullText) {
+        contentEl.innerHTML = renderMarkdown(fullText) + '<span class="cursor"></span>';
+        wireCopyButtons(contentEl);
+      } else {
+        contentEl.innerHTML = '<span class="cursor"></span>';
+      }
+
+      if (!userScrolledUp) scrollToBottom();
+    });
+  };
+
+  isStreaming = true;
+  updateSendBtn();
+
+  try {
+    const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: abortController.signal });
+
+    if (!res.ok) {
+      let errText = '';
+      try { errText = await res.text(); } catch (e) {}
+      let errMsg = `HTTP ${res.status} ${res.statusText}`;
+      try {
+        const j = JSON.parse(errText);
+        if (j.error?.message) errMsg = String(j.error.message).slice(0, 500);
+      } catch (e) { if (errText) errMsg += '\n' + errText.slice(0, 500); }
+      throw new Error(errMsg);
+    }
+
+    if (!res.body) throw new Error('No response body — streaming not supported by endpoint.');
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let nlIdx;
+      while ((nlIdx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, nlIdx).replace(/\r$/, '');
+        buffer = buffer.slice(nlIdx + 1);
+
+        if (line === '' || line.startsWith(':') || line.startsWith('event:') || line.startsWith('id:') || line.startsWith('retry:')) continue;
+        if (!line.startsWith('data:')) continue;
+
+        const data = line.slice(5).trim();
+        if (data === '[DONE]') continue;
+
+        try {
+          const json = JSON.parse(data);
+
+          if (json.usage && typeof json.usage === 'object') {
+            usage = {
+              prompt_tokens: Number(json.usage.prompt_tokens) || 0,
+              completion_tokens: Number(json.usage.completion_tokens) || 0,
+              total_tokens: Number(json.usage.total_tokens) || 0,
+            };
+          }
+
+          const choice = json.choices && json.choices[0];
+          if (!choice) continue;
+
+          const delta = choice.delta?.content ?? choice.message?.content ?? '';
+          const reasoningDelta = choice.delta?.reasoning_content
+                              ?? choice.delta?.reasoning
+                              ?? choice.message?.reasoning_content
+                              ?? '';
+
+          if (delta) { fullText += delta; scheduleRender(); }
+          if (reasoningDelta) { fullReasoningText += reasoningDelta; scheduleRender(); }
+        } catch (e) {
+          console.warn('Failed to parse SSE line:', data, e);
+        }
+      }
+    }
+
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      const line = buffer.trim();
+      if (line.startsWith('data:')) {
+        const data = line.slice(5).trim();
+        if (data && data !== '[DONE]') {
+          try {
+            const json = JSON.parse(data);
+            if (json.usage && typeof json.usage === 'object') {
+              usage = {
+                prompt_tokens: Number(json.usage.prompt_tokens) || 0,
+                completion_tokens: Number(json.usage.completion_tokens) || 0,
+                total_tokens: Number(json.usage.total_tokens) || 0,
+              };
+            }
+            const delta = json.choices?.[0]?.delta?.content ?? '';
+            const reasoningDelta = json.choices?.[0]?.delta?.reasoning_content ?? '';
+            if (delta) fullText += delta;
+            if (reasoningDelta) fullReasoningText += reasoningDelta;
+          } catch (e) {}
+        }
+      }
+    }
+
+    lastRenderText = fullText;
+    lastRenderReasoning = fullReasoningText;
+
+    if (fullReasoningText) {
+      reasoningEl.innerHTML = '<div class="msg-reasoning-label">Reasoning</div>' + escapeHtml(fullReasoningText);
+    } else {
+      reasoningEl.style.display = 'none';
+    }
+
+    contentEl.innerHTML = renderMarkdown(fullText);
+    wireCopyButtons(contentEl);
+
+    assistantNode.content = fullText;
+    assistantNode.reasoning = fullReasoningText;
+    if (usage) assistantNode.usage = usage;
+    await saveConversation(conv);
+    scrollToBottom();
+    renderCost();
+
+    if (!fullText && !fullReasoningText) {
+      contentEl.innerHTML = '<div class="error-msg">The model returned an empty response.</div>';
+    }
+
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      assistantNode.content = fullText;
+      assistantNode.reasoning = fullReasoningText;
+      if (usage) assistantNode.usage = usage;
+      if (fullReasoningText) {
+        reasoningEl.innerHTML = '<div class="msg-reasoning-label">Reasoning</div>' + escapeHtml(fullReasoningText);
+      } else {
+        reasoningEl.style.display = 'none';
+      }
+      contentEl.innerHTML = renderMarkdown(fullText || '_(stopped)_');
+      await saveConversation(conv);
+      renderCost();
+    } else {
+      console.error(err);
+      contentEl.innerHTML = '';
+      const errEl = document.createElement('div');
+      errEl.className = 'error-msg';
+      const strong = document.createElement('strong');
+      strong.textContent = 'Request failed: ';
+      errEl.appendChild(strong);
+      errEl.appendChild(document.createTextNode(String(err.message || err)));
+      contentEl.appendChild(errEl);
+      if (!fullText && !fullReasoningText) {
+        const parent = conv.messages[assistantNode.parentId];
+        if (parent) {
+          parent.children = parent.children.filter(id => id !== assistantNode.id);
+          parent.selectedChildIndex = Math.max(0, parent.children.length - 1);
+        }
+        delete conv.messages[assistantNode.id];
+      } else {
+        assistantNode.content = fullText;
+        assistantNode.reasoning = fullReasoningText;
+        if (usage) assistantNode.usage = usage;
+      }
+      await saveConversation(conv);
+      renderCost();
+    }
+  } finally {
+    messagesEl.removeEventListener('scroll', onScroll);
+    isStreaming = false;
+    abortController = null;
+    updateSendBtn();
+    inputEl.focus();
+  }
+}
+
+function stopStreaming() {
+  if (abortController) abortController.abort();
+}
+
+// ---------- Settings modal ----------
+function promptUnlockVault() {
+  return new Promise((resolve) => {
+    const overlay = $('unlockOverlay');
+    const input = $('unlockPassword');
+    const btn = $('unlockBtn');
+    const skip = $('unlockSkipBtn');
+
+    input.value = '';
+    input.placeholder = 'Vault password';
+    input.classList.remove('error');
+    overlay.classList.add('open');
+    input.focus();
+
+    const cleanup = () => {
+      overlay.classList.remove('open');
+      input.value = ''; // never leave the password sitting in the DOM
+      btn.removeEventListener('click', onUnlock);
+      skip.removeEventListener('click', onSkip);
+      input.removeEventListener('keydown', onKey);
+    };
+
+    const onUnlock = async () => {
+      const pw = input.value;
+      if (!pw) { input.focus(); return; }
+      try {
+        const key = await decryptSecret(state.config.apiKeyEncrypted, pw);
+        state.config.apiKey = key;
+        vaultPassword = pw;
+        cleanup();
+        toast('Vault unlocked');
+        resolve(true);
+      } catch (e) {
+        input.value = '';
+        input.placeholder = 'Incorrect password';
+        input.classList.add('error');
+        setTimeout(() => input.classList.remove('error'), 250);
+        input.focus();
+      }
+    };
+
+    const onSkip = () => {
+      cleanup();
+      resolve(false);
+    };
+
+    const onKey = (e) => {
+      if (e.key === 'Enter') onUnlock();
+      if (e.key === 'Escape') onSkip();
+    };
+
+    btn.addEventListener('click', onUnlock);
+    skip.addEventListener('click', onSkip);
+    input.addEventListener('keydown', onKey);
+  });
+}
+
+async function ensureVaultUnlocked() {
+  if (!state.config.apiKeyEncrypted) return true;
+  if (vaultPassword) return true;
+  return promptUnlockVault();
+}
+
+function lockVault() {
+  if (!state.config.apiKeyEncrypted) return;
+
+  state.config.apiKey = '';   // evict plaintext from memory
+  vaultPassword = null;       // evict password from memory
+
+  closeSettings();
+  updateConfigUI();
+  toast('Vault locked');
+}
+
+function toggleVaultFields() {
+  const on = $('cfgUseVault').checked;
+  $('vaultFields').style.display = on ? 'block' : 'none';
+  if (!on) {
+    $('cfgVaultPassword').value = '';
+    $('cfgVaultPasswordConfirm').value = '';
+  }
+}
+
+async function openSettings() {
+  // If key is encrypted but not in memory, unlock first
+  if (state.config.apiKeyEncrypted && !vaultPassword) {
+    const unlocked = await promptUnlockVault();
+    if (!unlocked) {
+      toast('Unlock the vault to change settings');
+      return;
+    }
+  }
+
+  resetPresetEditMode();
+
+  $('cfgEndpoint').value = state.config.endpoint;
+
+  // SECURITY: never write the stored key (plaintext or decrypted) into the DOM.
+  // Blank field = keep existing key.
+  $('cfgApiKey').value = '';
+  $('cfgApiKey').placeholder = (state.config.apiKeyEncrypted || state.config.apiKey)
+    ? '•••••••• (stored — type to replace)'
+    : 'sk-… or leave blank';
+
+  $('cfgUseVault').checked = !!state.config.apiKeyEncrypted;
+  toggleVaultFields();
+
+  $('cfgModel').value = state.config.model;
+  $('cfgSystemPrompt').value = state.config.systemPrompt || '';
+  $('cfgReasoningEffort').value = state.config.reasoningEffort || 'medium';
+
+  $('cfgTempEnabled').checked = state.config.tempEnabled !== false;
+  $('cfgTemp').value = state.config.temperature;
+
+  $('cfgTopPEnabled').checked = state.config.topPEnabled !== false;
+  $('cfgTopP').value = state.config.topP;
+
+  $('cfgTopKEnabled').checked = state.config.topKEnabled === true;
+  $('cfgTopK').value = state.config.topK;
+
+  $('cfgAdvancedSamplersEnabled').checked = state.config.advancedSamplersEnabled === true;
+
+  $('cfgMinPEnabled').checked = state.config.minPEnabled === true;
+  $('cfgMinP').value = state.config.minP ?? DEFAULTS.minP;
+
+  $('cfgPowerLawTargetEnabled').checked = state.config.powerLawTargetEnabled === true;
+  $('cfgPowerLawTarget').value = state.config.powerLawTarget ?? DEFAULTS.powerLawTarget;
+
+  $('cfgPowerLawDecayEnabled').checked = state.config.powerLawDecayEnabled === true;
+  $('cfgPowerLawDecay').value = state.config.powerLawDecay ?? DEFAULTS.powerLawDecay;
+
+  $('cfgAdaptiveTargetEnabled').checked = state.config.adaptiveTargetEnabled === true;
+  $('cfgAdaptiveTarget').value = state.config.adaptiveTarget ?? DEFAULTS.adaptiveTarget;
+
+  $('cfgAdaptiveDecayEnabled').checked = state.config.adaptiveDecayEnabled === true;
+  $('cfgAdaptiveDecay').value = state.config.adaptiveDecay ?? DEFAULTS.adaptiveDecay;
+
+  $('cfgMaxTokens').value = state.config.maxTokens;
+  $('cfgRequestStreamUsage').checked = state.config.requestStreamUsage !== false;
+
+  $('cfgInputPrice').value = state.config.inputPricePer1M ?? DEFAULTS.inputPricePer1M;
+  $('cfgOutputPrice').value = state.config.outputPricePer1M ?? DEFAULTS.outputPricePer1M;
+
+  const cfgMaxDim = $('cfgImageMaxDim');
+  const cfgQuality = $('cfgImageQuality');
+  if (cfgMaxDim) cfgMaxDim.value = state.config.imageMaxDim ?? DEFAULTS.imageMaxDim;
+  if (cfgQuality) cfgQuality.value = state.config.imageQuality ?? DEFAULTS.imageQuality;
+
+  // Vault UI
+  $('cfgVaultPassword').value = '';
+  $('cfgVaultPasswordConfirm').value = '';
+
+  const lockVaultBtn = $('lockVaultBtn');
+  if (lockVaultBtn) {
+    lockVaultBtn.style.display = (state.config.apiKeyEncrypted && vaultPassword)
+      ? 'inline-block'
+      : 'none';
+  }
+
+  renderPresetsInSettings();
+
+  document.querySelectorAll('.sampler-head input[type="checkbox"]').forEach(cb => cb.dispatchEvent(new Event('change')));
+  updateAdvancedControls();
+
+  $('modalOverlay').classList.add('open');
+  setTimeout(() => $('cfgModel').focus(), 100);
+}
+
+function closeSettings() {
+  resetPresetEditMode();
+  $('modalOverlay').classList.remove('open');
+
+  // Do not leave secrets in the DOM
+  $('cfgApiKey').value = '';
+  $('cfgVaultPassword').value = '';
+  $('cfgVaultPasswordConfirm').value = '';
+
+  const lockVaultBtn = $('lockVaultBtn');
+  if (lockVaultBtn) lockVaultBtn.style.display = 'none';
+}
+
+async function saveSettings() {
+  const cfg = gatherConfigFromInputs();
+  if (!isEndpointAllowed(cfg.endpoint)) {
+    toast('Endpoint must use HTTPS (plain HTTP is only allowed for localhost)');
+    return;
+  }
+  const existingEnc = state.config.apiKeyEncrypted;
+  const existingPlain = state.config.apiKey;
+  const processedCfg = await applyVaultEncryption(cfg, existingEnc, existingPlain);
+  if (!processedCfg) return;
+
+  Object.assign(state.config, processedCfg);
+  state.config.activePresetId = null;
+
+  await saveConfig();
+  updateConfigUI();
+  renderCost();
+  closeSettings();
+  toast('Settings saved');
+}
+
+function updateAdvancedControls() {
+  const on = $('cfgAdvancedSamplersEnabled').checked;
+  const section = $('advancedSamplersSection');
+  section.classList.toggle('disabled', !on);
+
+  const ids = ['cfgMinPEnabled', 'cfgPowerLawTargetEnabled', 'cfgPowerLawDecayEnabled', 'cfgAdaptiveTargetEnabled', 'cfgAdaptiveDecayEnabled'];
+  for (const id of ids) {
+    const chk = $(id);
+    const input = $(id.replace('Enabled', ''));
+    if (chk) {
+      chk.disabled = !on;
+      chk.parentElement.style.opacity = on ? '1' : '0.5';
+    }
+    if (input) {
+      input.disabled = !on || !chk.checked;
+      input.classList.toggle('disabled-input', !on || !chk.checked);
+    }
+  }
+}
+
+// ---------- Toast ----------
+let toastTimer;
+function toast(msg) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+}
+
+// ---------- Mobile sidebar ----------
+function openSidebarMobile() {
+  $('sidebar').classList.add('open');
+  $('sidebarBackdrop').classList.add('show');
+}
+function closeSidebarMobile() {
+  $('sidebar').classList.remove('open');
+  $('sidebarBackdrop').classList.remove('show');
+}
+
+// ---------- Event wiring ----------
+composer.addEventListener('submit', (e) => {
+  e.preventDefault();
+  if (isStreaming) { stopStreaming(); return; }
+  sendMessage();
+});
+
+inputEl.addEventListener('input', () => { autoGrow(); updateSendBtn(); });
+
+inputEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    if (!isStreaming) sendMessage();
+  }
+  if (e.key === 'Escape' && isStreaming) {
+    stopStreaming();
+  }
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    if ($('modalOverlay').classList.contains('open')) {
+      closeSettings();
+    } else if (isStreaming) {
+      stopStreaming();
+    }
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+    e.preventDefault();
+    if (isStreaming) { toast('Stop the current stream first'); return; }
+    newConversation();
+  }
+});
+
+$('newChatBtn').addEventListener('click', () => {
+  if (isStreaming) { toast('Stop the current stream first'); return; }
+  newConversation();
+  closeSidebarMobile();
+});
+$('settingsBtn').addEventListener('click', openSettings);
+$('cancelSettings').addEventListener('click', closeSettings);
+$('saveSettings').addEventListener('click', saveSettings);
+$('modalOverlay').addEventListener('click', (e) => {
+  if (e.target === $('modalOverlay')) closeSettings();
+});
+$('menuToggle').addEventListener('click', openSidebarMobile);
+$('sidebarBackdrop').addEventListener('click', closeSidebarMobile);
+
+$('modelPill').addEventListener('click', (e) => {
+  if (e.target.closest('.model-dropdown')) return;
+  toggleModelDropdown();
+});
+
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('#modelPill')) {
+    closeModelDropdown();
+  }
+});
+
+$('savePresetBtn').addEventListener('click', () => {
+  const name = $('cfgPresetName').value;
+  if (editingPresetId) {
+    updatePreset(editingPresetId, name);
+  } else {
+    saveCurrentAsPreset(name);
+  }
+  resetPresetEditMode();
+});
+
+$('cancelEditPresetBtn').addEventListener('click', () => {
+  resetPresetEditMode();
+  openSettings();
+});
+
+$('cfgPresetName').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    const name = $('cfgPresetName').value;
+    if (editingPresetId) {
+      updatePreset(editingPresetId, name);
+    } else {
+      saveCurrentAsPreset(name);
+    }
+    resetPresetEditMode();
+  }
+});
+
+$('exportChatBtn').addEventListener('click', exportCurrentChat);
+$('exportAllChats').addEventListener('click', exportAllChats);
+
+$('importChats').addEventListener('click', () => $('importFileInput').click());
+$('importFileInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (file) importChats(file);
+  e.target.value = '';
+});
+
+document.querySelectorAll('.sampler-grid .sampler-head input[type="checkbox"]').forEach(chk => {
+  chk.addEventListener('change', () => {
+    const inputId = chk.id.replace('Enabled', '');
+    const input = $(inputId);
+    if (!input || input === chk) return;
+    input.classList.toggle('disabled-input', !chk.checked);
+    input.disabled = !chk.checked;
+  });
+});
+
+$('cfgAdvancedSamplersEnabled').addEventListener('change', updateAdvancedControls);
+
+// Vault UI events
+$('cfgUseVault').addEventListener('change', toggleVaultFields);
+$('unlockOverlay').addEventListener('click', (e) => {
+  if (e.target === $('unlockOverlay')) {
+    $('unlockSkipBtn').click();
+  }
+});
+
+const lockVaultBtn = $('lockVaultBtn');
+if (lockVaultBtn) lockVaultBtn.addEventListener('click', lockVault);
+
+// ---------- Image attach event wiring ----------
+if (attachBtn) {
+  attachBtn.addEventListener('click', () => {
+    if (isStreaming) { toast('Stop the current stream first'); return; }
+    imageFileInput.click();
+  });
+}
+
+if (imageFileInput) {
+  imageFileInput.addEventListener('change', (e) => {
+    const files = e.target.files;
+    if (files && files.length) addImages(files);
+    e.target.value = '';
+  });
+}
+
+document.addEventListener('paste', (e) => {
+  if (!e.clipboardData) return;
+  const files = [];
+  for (const item of e.clipboardData.items || []) {
+    if (item.kind === 'file' && item.type && item.type.startsWith('image/')) {
+      const f = item.getAsFile();
+      if (f) files.push(f);
+    }
+  }
+  if (!files.length) return;
+  e.preventDefault();
+  addImages(files);
+});
+
+let dragDepth = 0;
+window.addEventListener('dragenter', (e) => {
+  if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+  dragDepth += 1;
+  composer.classList.add('dragover');
+});
+
+window.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files')) {
+    e.dataTransfer.dropEffect = 'copy';
+  }
+});
+
+window.addEventListener('dragleave', () => {
+  if (dragDepth === 0) return;
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) composer.classList.remove('dragover');
+});
+
+window.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  composer.classList.remove('dragover');
+  if (!e.dataTransfer) return;
+  const files = Array.from(e.dataTransfer.files || []).filter(
+    f => f.type && f.type.startsWith('image/')
+  );
+  if (files.length) addImages(files);
+});
+
+// ---------- Init ----------
+(async function init() {
+  await loadState();
+  ensureSidebarExpandedMonths();
+  updateConfigUI();
+
+  // Prompt for vault password before first use
+  if (state.config.apiKeyEncrypted) {
+    await ensureVaultUnlocked(); // user may skip
+  }
+
+  if (state.conversations.length === 0) {
+    await newConversation();
+  } else {
+    if (!state.activeId) state.activeId = state.conversations[0].id;
+    renderSidebar();
+    renderMessages();
+  }
+  updateSendBtn();
+  updateExportBtn();
+  inputEl.focus();
+})();
